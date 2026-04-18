@@ -10,6 +10,7 @@ For normal use, you need a second physical monitor or a virtual display. One dis
 
 ![YarrOverlay Control Window](./imgs/1.png)
 ![YarrOverlay Overlay Output](./imgs/2.png)
+![YarrOverlay Overlay](./imgs/3.png)
 
 ## What it does
 
