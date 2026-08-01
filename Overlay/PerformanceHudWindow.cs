@@ -20,10 +20,11 @@ internal sealed class PerformanceHudWindow : Form
     protected override CreateParams CreateParams { get { var cp=base.CreateParams; cp.ExStyle|=NativeMethods.WsExTransparent|NativeMethods.WsExToolWindow|NativeMethods.WsExNoActivate; return cp; } }
     protected override bool ShowWithoutActivation => true;
     public void SetMonitor(MonitorInfo monitor) { _monitor=monitor; Location=new Point(monitor.Bounds.X+16,monitor.Bounds.Y+16); }
-    public void SetMode(PerformanceHudMode mode, bool running) { _mode=mode; if(mode==PerformanceHudMode.Off||!running) Hide(); else { ClientSize=mode==PerformanceHudMode.Basic?new Size(510,92):new Size(510,190); Show(); NativeMethods.SetWindowPos(Handle,new IntPtr(NativeMethods.HwndTopmost),Left,Top,Width,Height,NativeMethods.SwpNoActivate|NativeMethods.SwpShowWindow); } }
+    public void SetMode(PerformanceHudMode mode, bool running) { _mode=mode; if(mode==PerformanceHudMode.Off||!running) Hide(); else { ClientSize=mode==PerformanceHudMode.Basic?new Size(220,38):new Size(510,190); Show(); NativeMethods.SetWindowPos(Handle,new IntPtr(NativeMethods.HwndTopmost),Left,Top,Width,Height,NativeMethods.SwpNoActivate|NativeMethods.SwpShowWindow); } }
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e); var p=LatencyMetrics.Global.Snapshot(); var w=p.TenSeconds; var y=10f;
+        if(_mode==PerformanceHudMode.Basic){e.Graphics.DrawString($"YarrOverlay | {F(p.TotalAppLatencyEstimateMs)} ms",_font,Brushes.White,10,y);return;}
         void Line(string s){e.Graphics.DrawString(s,_font,Brushes.White,10,y);y+=20;}
         Line($"YarrOverlay | submit {w.SubmitFps:F1} fps | queue {p.QueueLength}/{p.MaxQueueLength}");
         e.Graphics.DrawString($"TOTAL APP LATENCY  {F(p.TotalAppLatencyEstimateMs)} ms  (estimate)",_totalFont,Brushes.LightGreen,10,y);y+=30;
