@@ -2,7 +2,6 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Vortice.Direct3D;
@@ -16,552 +15,159 @@ namespace Overlay;
 
 internal sealed class DuplicationCapture : IDisposable
 {
-    private readonly object _sync = new();
-    private Thread? _thread;
-    private CancellationTokenSource? _cts;
-    private MonitorInfo? _inputMonitor;
-    private MonitorInfo? _outputMonitor;
-    private int _threshold;
-    private float _sharpness;
-    private bool _disposed;
-
-    public event Action<Bitmap>? FrameReady;
-    public event Action<int>? FpsChanged;
-
-    public void Start(MonitorInfo inputMonitor, MonitorInfo outputMonitor, int threshold, float sharpness)
+    private readonly object _sync = new(); private Thread? _thread; private CancellationTokenSource? _cts;
+    private MonitorInfo? _input; private MonitorInfo? _output; private int _threshold; private float _sharpness; private ScalingMode _scaling; private IntPtr _overlayHwnd; private CaptureOptions _options; private bool _disposed;
+    private readonly LatencyMetrics _metrics = LatencyMetrics.Global;
+    public event Action<FrameEnvelope>? FrameReady;
+    public event Action<CaptureDiagnostics>? DiagnosticsChanged;
+    public event Action<string>? RecreateRequested;
+    public void Start(MonitorInfo input, MonitorInfo output, int threshold, float sharpness, ScalingMode scaling, IntPtr overlayHwnd, CaptureOptions options)
     {
-        lock (_sync)
-        {
-            StopInternal();
-
-            _inputMonitor = inputMonitor;
-            _outputMonitor = outputMonitor;
-            _threshold = threshold;
-            _sharpness = sharpness;
-            _cts = new CancellationTokenSource();
-            _thread = new Thread(() => CaptureLoop(_cts.Token))
-            {
-                IsBackground = true,
-                Name = "YarrOverlayCapture",
-                Priority = ThreadPriority.Highest
-            };
-            _thread.SetApartmentState(ApartmentState.MTA);
-            _thread.Start();
-        }
+        lock (_sync) { StopInternal(); _input = input; _output = output; _threshold = threshold; _sharpness = sharpness; _scaling = scaling; _overlayHwnd = overlayHwnd; _options = options; _metrics.Reset(); _cts = new CancellationTokenSource(); _thread = new Thread(() => CaptureLoop(_cts.Token)) { IsBackground = true, Name = "YarrOverlayCapture", Priority = options.ThreadPriority switch { CapturePriority.Highest => ThreadPriority.Highest, CapturePriority.AboveNormal => ThreadPriority.AboveNormal, _ => ThreadPriority.Normal } }; _thread.SetApartmentState(ApartmentState.MTA); _thread.Start(); }
     }
-
-    public void SetThreshold(int threshold)
-    {
-        _threshold = threshold;
-    }
-
-    public void SetSharpness(float sharpness)
-    {
-        _sharpness = Math.Clamp(sharpness, 0.0f, 1.0f);
-    }
-
-    public void Stop()
-    {
-        lock (_sync)
-        {
-            StopInternal();
-        }
-    }
-
-    public void Dispose()
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        _disposed = true;
-        Stop();
-    }
-
-    private void StopInternal()
-    {
-        if (_cts is null)
-        {
-            return;
-        }
-
-        _cts.Cancel();
-        _thread?.Join();
-        _thread = null;
-        _cts.Dispose();
-        _cts = null;
-        FpsChanged?.Invoke(0);
-    }
+    public void SetThreshold(int threshold) => Volatile.Write(ref _threshold, threshold);
+    public void SetSharpness(float sharpness) => Volatile.Write(ref _sharpness, Math.Clamp(sharpness, 0, 1));
+    public void Stop() { lock (_sync) StopInternal(); }
+    public void Dispose() { if (_disposed) return; _disposed = true; Stop(); }
+    private void StopInternal() { if (_cts is null) return; _cts.Cancel(); if (_thread != Thread.CurrentThread) _thread?.Join(); _thread = null; _cts.Dispose(); _cts = null; DiagnosticsChanged?.Invoke(CaptureDiagnostics.Empty); }
 
     private void CaptureLoop(CancellationToken token)
     {
-        if (_inputMonitor is null || _outputMonitor is null)
+        var failures = 0; long dropped = 0; var recreateCount = 0; var frames = 0; var fpsClock = Stopwatch.StartNew(); DateTimeOffset? lastFrame = null; var lastError = ""; long recoveryStarted = 0; double lastRecoveryMs = 0, totalRecoveryMs = 0;
+        IntPtr mmcss = IntPtr.Zero; if (_options.EnableMmcss) { mmcss = NativeMethods.AvSetMmThreadCharacteristics("Games", out _); if (mmcss == IntPtr.Zero) Logger.Error($"MMCSS registration failed: {Marshal.GetLastWin32Error()}"); }
+        using var csv = _options.CsvEnabled ? new PerformanceCsvWriter() : null;
+        var collectMetrics = _options.MetricsMode != MetricsMode.Off;
+        var spin = new SpinWait();
+        try
         {
-            return;
-        }
-
-        using var context = CreateCaptureContext(_inputMonitor, _outputMonitor);
-        using var titleFont = new Font("Segoe UI Semibold", 26f, FontStyle.Bold, GraphicsUnit.Pixel);
-        using var titleShadowBrush = new SolidBrush(System.Drawing.Color.FromArgb(220, 0, 0, 0));
-        using var titleBrush = new SolidBrush(System.Drawing.Color.FromArgb(255, 255, 230, 120));
-        using var centerFormat = new StringFormat
-        {
-            Alignment = StringAlignment.Center,
-            LineAlignment = StringAlignment.Near
-        };
-
-        var frameCounter = 0;
-        var fpsWatch = Stopwatch.StartNew();
-
         while (!token.IsCancellationRequested)
         {
-            IDXGIResource? desktopResource = null;
-
             try
             {
-                var result = context.Duplication.AcquireNextFrame(0, out var _, out desktopResource);
-                if (result.Failure)
+                if (_input is null || _output is null) return;
+                using var context = CreateContext(_input, _output);
+                using var gpuTimestamps = _options.MetricsMode == MetricsMode.DetailedGpu ? new GpuTimestampCollector(context.Device) : null;
+                GpuOverlayRenderer? gpu = null;
+                var sameAdapter = string.Equals(_input.AdapterLuid, _output.AdapterLuid, StringComparison.Ordinal);
+                if (_options.PipelineMode != PipelineMode.LegacyCpu && sameAdapter)
                 {
-                    if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code)
-                    {
-                        Thread.Yield();
-                        continue;
-                    }
-
-                    if (result.Code == Vortice.DXGI.ResultCode.AccessLost.Code)
-                    {
-                        break;
-                    }
-
-                    Thread.Yield();
-                    continue;
+                    try { gpu = GpuOverlayRenderer.Create(context.Device, context.Factory, _overlayHwnd, context.OutputWidth, context.OutputHeight, _options.MaximumFrameLatency); Logger.Info("Pipeline mode: GPU Native (DirectComposition, single GPU, one source copy)"); }
+                    catch (Exception ex) when (_options.PipelineMode == PipelineMode.Auto) { Logger.Error($"GPU Native initialization failed; using Legacy CPU fallback: {ex}"); }
                 }
-
-                using var frameTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
-                context.DeviceContext.CopyResource(context.SourceTexture, frameTexture);
-                context.DeviceContext.UpdateSubresource(
-                    new ShaderParams
-                    {
-                        Threshold = _threshold / 255.0f,
-                        Feather = 24.0f / 255.0f,
-                        InvInputWidth = 1.0f / context.InputWidth,
-                        InvInputHeight = 1.0f / context.InputHeight,
-                        Sharpness = _sharpness,
-                        Padding = 0.0f
-                    },
-                    context.ShaderParamsBuffer);
-
-                context.DeviceContext.OMSetRenderTargets(context.OutputRenderTargetView);
-                context.DeviceContext.RSSetViewport(0, 0, context.OutputWidth, context.OutputHeight);
-                context.DeviceContext.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-                context.DeviceContext.VSSetShader(context.VertexShader);
-                context.DeviceContext.PSSetShader(context.PixelShader);
-                context.DeviceContext.PSSetShaderResource(0, context.SourceShaderResourceView);
-                context.DeviceContext.PSSetSampler(0, context.LinearSampler);
-                context.DeviceContext.PSSetConstantBuffer(0, context.ShaderParamsBuffer);
-                context.DeviceContext.ClearRenderTargetView(context.OutputRenderTargetView, new Color4(0f, 0f, 0f, 0f));
-                context.DeviceContext.Draw(3, 0);
-                context.DeviceContext.PSSetShaderResource(0, null!);
-                context.DeviceContext.CopyResource(context.OutputStagingTexture, context.OutputTexture);
-
-                var map = context.DeviceContext.Map(
-                    context.OutputStagingTexture,
-                    0,
-                    MapMode.Read,
-                    Vortice.Direct3D11.MapFlags.None,
-                    out MappedSubresource mapped);
-
-                if (map.Failure)
+                else if (!sameAdapter) Logger.Info("Pipeline mode: Legacy CPU fallback (cross-adapter GPU sharing is not enabled)");
+                if (_options.PipelineMode == PipelineMode.GpuNative && gpu is null) throw new InvalidOperationException("GPU Native was requested but cannot initialize on the selected adapter route.");
+                if (gpu is null) context.EnsureLegacyResources();
+                var pipelineName = gpu is null ? "Legacy CPU" : "GPU Native";
+                if (recoveryStarted != 0) { lastRecoveryMs = FrameTiming.Ms(recoveryStarted, FrameTiming.Now); totalRecoveryMs += lastRecoveryMs; recoveryStarted = 0; }
+                using (gpu)
                 {
-                    context.Duplication.ReleaseFrame();
-                    continue;
-                }
-
-                try
+                Logger.Info($"Duplication created successfully for {_input.DeviceName} on {_input.AdapterName}.");
+                while (!token.IsCancellationRequested)
                 {
-                    Bitmap? frame = null;
-
+                    IDXGIResource? resource = null;
                     try
                     {
-                        frame = new Bitmap(context.OutputWidth, context.OutputHeight, PixelFormat.Format32bppArgb);
-                        CopyMappedTextureToBitmap(frame, mapped.DataPointer, (int)mapped.RowPitch);
-
-                        using (var g = Graphics.FromImage(frame))
+                        var timing = new FrameTiming { AcquireCallStart = FrameTiming.Now };
+                        var result = context.Duplication.AcquireNextFrame(0, out var frameInfo, out resource);
+                        timing.AcquireReturned = FrameTiming.Now; timing.DesktopPresentTime = frameInfo.LastPresentTime; timing.DesktopMouseUpdateTime = frameInfo.LastMouseUpdateTime; timing.AccumulatedFrames = (int)frameInfo.AccumulatedFrames; timing.TotalMetadataBufferSize = frameInfo.TotalMetadataBufferSize; timing.PointerVisible = frameInfo.PointerPosition.Visible; timing.ProtectedContentMaskedOut = frameInfo.ProtectedContentMaskedOut;
+                        if (result.Failure)
                         {
-                            var titleBounds = new RectangleF(0, 14, frame.Width, 40);
-                            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                            g.DrawString("YarrOverlay <<", titleFont, titleShadowBrush, new RectangleF(3, 17, frame.Width, 40), centerFormat);
-                            g.DrawString("YarrOverlay <<", titleFont, titleBrush, titleBounds, centerFormat);
+                            if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { if(collectMetrics)_metrics.RecordTimeout(); spin.SpinOnce(); continue; }
+                            if(collectMetrics)_metrics.RecordDxgiError();
+                            failures++; var error = $"AcquireNextFrame failed: 0x{result.Code:X8}"; lastError = error; Logger.Error(error);
+                            if (IsRecoverable(result.Code)) { recreateCount++; RecreateRequested?.Invoke(error); break; }
+                            Thread.Yield(); continue;
                         }
-
-                        var frameReady = FrameReady;
-                        if (frameReady is null)
+                        spin.Reset(); if(collectMetrics)_metrics.RecordCaptured((int)frameInfo.AccumulatedFrames);
+                        if (frameInfo.LastPresentTime == 0) continue;
+                        using var texture = resource.QueryInterface<ID3D11Texture2D>();
+                        if (gpuTimestamps is not null)
                         {
-                            frame.Dispose();
-                            frame = null;
+                            gpuTimestamps.TryCollect(context.DeviceContext, out timing.GpuCopyMs, out timing.GpuShaderMs, out timing.GpuTotalMs);
+                            gpuTimestamps.Begin(context.DeviceContext);
                         }
-                        else
+                        context.DeviceContext.CopyResource(context.SourceTexture, texture); timing.SourceCopySubmitted = FrameTiming.Now;
+                        gpuTimestamps?.CopyFinished(context.DeviceContext);
+                        UpdateShaderParamsIfChanged(context);
+                        var renderTarget = gpu?.CurrentRenderTarget ?? context.LegacyRtv!;
+                        context.DeviceContext.OMSetRenderTargets(renderTarget); context.DeviceContext.RSSetViewport(0, 0, context.OutputWidth, context.OutputHeight);
+                        context.DeviceContext.IASetPrimitiveTopology(PrimitiveTopology.TriangleList); context.DeviceContext.VSSetShader(context.Vs); context.DeviceContext.PSSetShader(context.Ps);
+                        context.DeviceContext.PSSetShaderResource(0, context.Srv); context.DeviceContext.PSSetSampler(0, context.Sampler); context.DeviceContext.PSSetConstantBuffer(0, context.Params);
+                        context.DeviceContext.ClearRenderTargetView(renderTarget, new Color4(0, 0, 0, 0)); context.DeviceContext.Draw(3, 0); context.DeviceContext.PSSetShaderResource(0, null!); timing.ShaderSubmitted = FrameTiming.Now;
+                        gpuTimestamps?.ShaderFinished(context.DeviceContext);
+
+                        if (gpu is not null)
                         {
-                            frameReady(frame);
-                            frame = null;
-                        }
-                    }
-                    finally
-                    {
-                        frame?.Dispose();
-                    }
-                }
-                finally
-                {
-                    context.DeviceContext.Unmap(context.OutputStagingTexture, 0);
-                    context.Duplication.ReleaseFrame();
-                }
-
-                frameCounter++;
-                if (fpsWatch.ElapsedMilliseconds >= 1000)
-                {
-                    FpsChanged?.Invoke(frameCounter);
-                    frameCounter = 0;
-                    fpsWatch.Restart();
-                }
-            }
-            catch
-            {
-                break;
-            }
-            finally
-            {
-                desktopResource?.Dispose();
-            }
-        }
-    }
-
-    private CaptureContext CreateCaptureContext(MonitorInfo inputMonitor, MonitorInfo outputMonitor)
-    {
-        var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
-
-        for (var adapterIndex = 0; ; adapterIndex++)
-        {
-            var adapterResult = factory.EnumAdapters1((uint)adapterIndex, out var adapter);
-            if (adapterResult.Failure || adapter is null)
-            {
-                break;
-            }
-
-            using (adapter)
-            {
-                for (var outputIndex = 0; ; outputIndex++)
-                {
-                    var outputResult = adapter.EnumOutputs((uint)outputIndex, out var output);
-                    if (outputResult.Failure || output is null)
-                    {
-                        break;
-                    }
-
-                    using (output)
-                    {
-                        var outputDesc = output.Description;
-                        if (!string.Equals(outputDesc.DeviceName, inputMonitor.DeviceName, StringComparison.OrdinalIgnoreCase))
-                        {
+                            timing.SubmitStarted = FrameTiming.Now; var present = gpu.Present(); timing.SubmitReturned = FrameTiming.Now;
+                            if (present.Backlogged) { timing.FrameDroppedOrReplaced = FrameTiming.Now; dropped++; if(collectMetrics)_metrics.RecordDropped(); continue; }
+                            if (present.HasStatistics) { timing.PresentCount=present.Statistics.PresentCount; timing.PresentRefreshCount=present.Statistics.PresentRefreshCount; timing.SyncRefreshCount=present.Statistics.SyncRefreshCount; timing.PresentSyncQpcTime=present.Statistics.SyncQPCTime; }
+                            if(collectMetrics) LatencyMetrics.Global.RecordSubmitted(timing); lastFrame = DateTimeOffset.Now; frames++;
+                            if (csv is not null && timing.FrameId % _options.CsvIntervalFrames == 0) csv.TryWrite(timing, pipelineName, _input.AdapterName, _output.AdapterName, 0, present.ResultCode);
+                            _metrics.RenderThreadId = Environment.CurrentManagedThreadId;
+                            PublishDiagnosticsIfDue(ref frames, fpsClock, dropped, failures, lastFrame, recreateCount, pipelineName, csv?.LostRows ?? 0, lastError, lastRecoveryMs, totalRecoveryMs);
                             continue;
                         }
 
-                        var featureLevels = new[]
-                        {
-                            FeatureLevel.Level_11_1,
-                            FeatureLevel.Level_11_0,
-                            FeatureLevel.Level_10_1,
-                            FeatureLevel.Level_10_0
-                        };
-
-                        var createResult = D3D11CreateDevice(
-                            adapter,
-                            DriverType.Unknown,
-                            DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport,
-                            featureLevels,
-                            out ID3D11Device device,
-                            out _,
-                            out ID3D11DeviceContext deviceContext);
-
-                        if (createResult.Failure)
-                        {
-                            throw new InvalidOperationException($"D3D11CreateDevice failed: {createResult.Code}");
-                        }
-
-                        var output1 = output.QueryInterface<IDXGIOutput1>();
-                        var duplication = output1.DuplicateOutput(device);
-
-                        var sourceTextureDesc = new Texture2DDescription(
-                            Format.B8G8R8A8_UNorm,
-                            (uint)inputMonitor.Bounds.Width,
-                            (uint)inputMonitor.Bounds.Height,
-                            1,
-                            1,
-                            BindFlags.ShaderResource,
-                            ResourceUsage.Default,
-                            CpuAccessFlags.None,
-                            1,
-                            0,
-                            ResourceOptionFlags.None);
-
-                        var sourceTexture = device.CreateTexture2D(sourceTextureDesc);
-                        var sourceShaderResourceView = device.CreateShaderResourceView(sourceTexture);
-
-                        var outputTextureDesc = new Texture2DDescription(
-                            Format.B8G8R8A8_UNorm,
-                            (uint)outputMonitor.Bounds.Width,
-                            (uint)outputMonitor.Bounds.Height,
-                            1,
-                            1,
-                            BindFlags.RenderTarget,
-                            ResourceUsage.Default,
-                            CpuAccessFlags.None,
-                            1,
-                            0,
-                            ResourceOptionFlags.None);
-
-                        var outputTexture = device.CreateTexture2D(outputTextureDesc);
-                        var outputRenderTargetView = device.CreateRenderTargetView(outputTexture);
-
-                        var outputStagingTextureDesc = new Texture2DDescription(
-                            Format.B8G8R8A8_UNorm,
-                            (uint)outputMonitor.Bounds.Width,
-                            (uint)outputMonitor.Bounds.Height,
-                            1,
-                            1,
-                            BindFlags.None,
-                            ResourceUsage.Staging,
-                            CpuAccessFlags.Read,
-                            1,
-                            0,
-                            ResourceOptionFlags.None);
-
-                        var outputStagingTexture = device.CreateTexture2D(outputStagingTextureDesc);
-                        var linearSampler = device.CreateSamplerState(SamplerDescription.LinearClamp);
-
-                        var vertexShaderBytecode = Compiler.Compile(
-                            ShaderSource,
-                            "VSMain",
-                            "YarrOverlayGpu.hlsl",
-                            "vs_4_0",
-                            ShaderFlags.OptimizationLevel3);
-
-                        var pixelShaderBytecode = Compiler.Compile(
-                            ShaderSource,
-                            "PSMain",
-                            "YarrOverlayGpu.hlsl",
-                            "ps_4_0",
-                            ShaderFlags.OptimizationLevel3);
-
-                        var vertexShader = device.CreateVertexShader(vertexShaderBytecode.Span);
-                        var pixelShader = device.CreatePixelShader(pixelShaderBytecode.Span);
-                        var shaderParamsBuffer = device.CreateBuffer(
-                            new BufferDescription((uint)Marshal.SizeOf<ShaderParams>(), BindFlags.ConstantBuffer));
-
-                        return new CaptureContext(
-                            factory,
-                            device,
-                            deviceContext,
-                            duplication,
-                            sourceTexture,
-                            sourceShaderResourceView,
-                            outputTexture,
-                            outputRenderTargetView,
-                            outputStagingTexture,
-                            linearSampler,
-                            vertexShader,
-                            pixelShader,
-                            shaderParamsBuffer,
-                            inputMonitor.Bounds.Width,
-                            inputMonitor.Bounds.Height,
-                            outputMonitor.Bounds.Width,
-                            outputMonitor.Bounds.Height);
+                        // UpdateLayeredWindow requires a CPU-backed DIB. This is the one unavoidable readback in the existing WinForms overlay architecture.
+                        context.DeviceContext.CopyResource(context.LegacyStaging!, context.LegacyOutputTexture!); timing.StagingCopySubmitted = FrameTiming.Now;
+                        timing.MapStarted = FrameTiming.Now; var mapResult = context.DeviceContext.Map(context.LegacyStaging!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None, out MappedSubresource mapped); timing.MapReturned = FrameTiming.Now;
+                        if (mapResult.Failure) { dropped++; if(collectMetrics)_metrics.RecordDropped(); continue; }
+                        try { var frame = new Bitmap(context.OutputWidth, context.OutputHeight, PixelFormat.Format32bppArgb); timing.CpuCopyStarted = FrameTiming.Now; CopyToBitmap(frame, mapped.DataPointer, (int)mapped.RowPitch); timing.CpuCopyFinished = FrameTiming.Now; timing.FrameEventRaised = FrameTiming.Now; FrameReady?.Invoke(new FrameEnvelope(frame, timing, csv, pipelineName, _input.AdapterName, _output.AdapterName, _options.CsvIntervalFrames, collectMetrics)); }
+                        finally { context.DeviceContext.Unmap(context.LegacyStaging!, 0); }
+                        lastFrame = DateTimeOffset.Now; frames++;
+                        PublishDiagnosticsIfDue(ref frames, fpsClock, dropped, failures, lastFrame, recreateCount, pipelineName, csv?.LostRows ?? 0, lastError, lastRecoveryMs, totalRecoveryMs);
                     }
+                    finally { if (resource is not null) { context.Duplication.ReleaseFrame(); resource.Dispose(); } }
+                }
                 }
             }
+            catch (Exception ex) { recreateCount++; failures++; lastError=$"{ex.GetType().Name}: {ex.Message}"; if(recoveryStarted==0) recoveryStarted=FrameTiming.Now; Logger.Error($"Duplication recreation required: {lastError}"); RecreateRequested?.Invoke(ex.Message); if (!token.IsCancellationRequested) Thread.Sleep(250); }
         }
-
-        factory.Dispose();
-        throw new InvalidOperationException($"Could not create duplication for {inputMonitor.DeviceName}.");
+        }
+        finally { if (mmcss != IntPtr.Zero) NativeMethods.AvRevertMmThreadCharacteristics(mmcss); }
     }
 
-    private unsafe void CopyMappedTextureToBitmap(Bitmap bitmap, nint sourcePtr, int sourceRowPitch)
+    private void PublishDiagnosticsIfDue(ref int frames, Stopwatch clock, long dropped, int failures, DateTimeOffset? lastFrame, int recreates, string pipeline, long csvLost, string lastError, double lastRecoveryMs, double totalRecoveryMs)
     {
-        var rect = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
-        var data = bitmap.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-
-        try
-        {
-            for (var y = 0; y < bitmap.Height; y++)
-            {
-                var src = (byte*)sourcePtr + (y * sourceRowPitch);
-                var dst = (byte*)data.Scan0 + (y * data.Stride);
-                Buffer.MemoryCopy(src, dst, data.Stride, bitmap.Width * 4L);
-            }
-        }
-        finally
-        {
-            bitmap.UnlockBits(data);
-        }
+        if (clock.ElapsedMilliseconds < 1000) return;
+        using var process=Process.GetCurrentProcess();
+        DiagnosticsChanged?.Invoke(new CaptureDiagnostics(frames, dropped, failures, lastFrame, lastFrame is null || DateTimeOffset.Now - lastFrame > TimeSpan.FromSeconds(2), recreates, lastError, _metrics.Snapshot(), pipeline, Environment.CurrentManagedThreadId, _metrics.RenderThreadId, _input?.AdapterName ?? "", _output?.AdapterName ?? "", _input?.AdapterLuid == _output?.AdapterLuid, csvLost, GC.CollectionCount(0),GC.CollectionCount(1),GC.CollectionCount(2),GC.GetTotalAllocatedBytes(false),process.WorkingSet64, lastRecoveryMs, totalRecoveryMs));
+        frames = 0; clock.Restart();
     }
-
+    private static bool IsRecoverable(int code) => code == Vortice.DXGI.ResultCode.AccessLost.Code || code == Vortice.DXGI.ResultCode.InvalidCall.Code || code == Vortice.DXGI.ResultCode.DeviceRemoved.Code || code == Vortice.DXGI.ResultCode.DeviceReset.Code;
+    private ShaderParams BuildParams(CaptureContext c)
+    {
+        var inputAspect = c.InputWidth / (float)c.InputHeight; var outputAspect = c.OutputWidth / (float)c.OutputHeight; var scaleX = 1f; var scaleY = 1f;
+        if (_scaling == ScalingMode.Fit) { if (inputAspect > outputAspect) scaleY = outputAspect / inputAspect; else scaleX = inputAspect / outputAspect; }
+        if (_scaling == ScalingMode.Fill) { if (inputAspect > outputAspect) scaleX = inputAspect / outputAspect; else scaleY = outputAspect / inputAspect; }
+        return new ShaderParams { Threshold = Volatile.Read(ref _threshold) / 255f, Feather = 24 / 255f, InvW = 1f / c.InputWidth, InvH = 1f / c.InputHeight, Sharpness = Volatile.Read(ref _sharpness), ScaleX = scaleX, ScaleY = scaleY, Rotation = RotationValue(_input!.Rotation) };
+    }
+    private void UpdateShaderParamsIfChanged(CaptureContext c)
+    {
+        var value=BuildParams(c); if(c.HasParams && c.LastParams.Equals(value)) return;
+        c.DeviceContext.UpdateSubresource(value,c.Params); c.LastParams=value; c.HasParams=true;
+    }
+    private static float RotationValue(string rotation) => rotation.Contains("Rotate90", StringComparison.OrdinalIgnoreCase) ? 1 : rotation.Contains("Rotate180", StringComparison.OrdinalIgnoreCase) ? 2 : rotation.Contains("Rotate270", StringComparison.OrdinalIgnoreCase) ? 3 : 0;
+    private CaptureContext CreateContext(MonitorInfo input, MonitorInfo output)
+    {
+        var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
+        for (uint ai = 0; ; ai++) { var ar = factory.EnumAdapters1(ai, out var adapter); if (ar.Failure || adapter is null) break; using (adapter) { if (adapter.Description1.Luid.ToString() != input.AdapterLuid) continue; var or = adapter.EnumOutputs(input.OutputIndex, out var dxgiOutput); if (or.Failure || dxgiOutput is null) continue; using (dxgiOutput) { if (!string.Equals(dxgiOutput.Description.DeviceName.TrimEnd('\0'), input.DeviceName, StringComparison.OrdinalIgnoreCase)) continue; var cr = D3D11CreateDevice(adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport, new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0, FeatureLevel.Level_10_1, FeatureLevel.Level_10_0 }, out ID3D11Device device, out _, out ID3D11DeviceContext dc); if (cr.Failure) throw new InvalidOperationException($"D3D11CreateDevice: 0x{cr.Code:X8}"); var output1 = dxgiOutput.QueryInterface<IDXGIOutput1>(); var duplication = output1.DuplicateOutput(device); return new CaptureContext(factory, device, dc, duplication, input.Bounds.Width, input.Bounds.Height, output.Bounds.Width, output.Bounds.Height); } } }
+        factory.Dispose(); throw new InvalidOperationException($"DXGI output was not found: {input.Identity}");
+    }
+    private static unsafe void CopyToBitmap(Bitmap bitmap, nint ptr, int pitch) { var data = bitmap.LockBits(new Rectangle(0, 0, bitmap.Width, bitmap.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb); try { for (var y = 0; y < bitmap.Height; y++) Buffer.MemoryCopy((byte*)ptr + y * pitch, (byte*)data.Scan0 + y * data.Stride, data.Stride, bitmap.Width * 4L); } finally { bitmap.UnlockBits(data); } }
+    [StructLayout(LayoutKind.Sequential)] private struct ShaderParams { public float Threshold, Feather, InvW, InvH, Sharpness, ScaleX, ScaleY, Rotation; }
     private const string ShaderSource = """
-cbuffer ShaderParams : register(b0)
-{
-    float threshold;
-    float feather;
-    float invInputWidth;
-    float invInputHeight;
-    float sharpness;
-    float padding0;
-    float padding1;
-    float padding2;
-};
-
-Texture2D inputTexture : register(t0);
-SamplerState linearSampler : register(s0);
-
-struct VSOutput
-{
-    float4 position : SV_POSITION;
-    float2 uv : TEXCOORD0;
-};
-
-VSOutput VSMain(uint vertexId : SV_VertexID)
-{
-    float2 positions[3] =
-    {
-        float2(-1.0, -1.0),
-        float2(-1.0, 3.0),
-        float2(3.0, -1.0)
-    };
-
-    float2 uvs[3] =
-    {
-        float2(0.0, 1.0),
-        float2(0.0, -1.0),
-        float2(2.0, 1.0)
-    };
-
-    VSOutput output;
-    output.position = float4(positions[vertexId], 0.0, 1.0);
-    output.uv = uvs[vertexId];
-    return output;
-}
-
-float4 PSMain(VSOutput input) : SV_TARGET
-{
-    float2 texel = float2(invInputWidth, invInputHeight);
-    float2 uv = saturate(input.uv);
-
-    float4 center = inputTexture.Sample(linearSampler, uv);
-    float4 north = inputTexture.Sample(linearSampler, saturate(uv + float2(0.0, -texel.y)));
-    float4 south = inputTexture.Sample(linearSampler, saturate(uv + float2(0.0, texel.y)));
-    float4 west = inputTexture.Sample(linearSampler, saturate(uv + float2(-texel.x, 0.0)));
-    float4 east = inputTexture.Sample(linearSampler, saturate(uv + float2(texel.x, 0.0)));
-
-    float3 neighborAverage = (north.rgb + south.rgb + west.rgb + east.rgb) * 0.25;
-    float3 detail = center.rgb - neighborAverage;
-    float detailStrength = saturate(length(detail) * 4.0);
-    float sharpenAmount = sharpness * (1.0 - detailStrength * 0.35);
-
-    float4 color = center;
-    color.rgb = saturate(center.rgb + detail * sharpenAmount);
-
-    float maxChannel = max(color.r, max(color.g, color.b));
-    float alpha = saturate((maxChannel - threshold) / max(feather, 0.00001));
-    color.a *= alpha;
-    return color;
-}
+cbuffer P : register(b0) { float threshold, feather, invW, invH, sharpness, scaleX, scaleY, rotation; }; Texture2D t : register(t0); SamplerState s : register(s0);
+struct O { float4 p:SV_POSITION; float2 uv:TEXCOORD0; }; O VSMain(uint id:SV_VertexID) { float2 ps[3]={float2(-1,-1),float2(-1,3),float2(3,-1)}; float2 u[3]={float2(0,1),float2(0,-1),float2(2,1)}; O o; o.p=float4(ps[id],0,1); o.uv=u[id]; return o; }
+float2 RotateUv(float2 u) { if(rotation==1) return float2(1-u.y,u.x); if(rotation==2) return 1-u; if(rotation==3) return float2(u.y,1-u.x); return u; }
+float4 PSMain(O i):SV_TARGET { float2 uv=(i.uv-float2(.5,.5))/float2(scaleX,scaleY)+float2(.5,.5); if(any(uv<0)||any(uv>1)) return 0; uv=RotateUv(uv); float2 q=float2(invW,invH); float4 c=t.Sample(s,uv); float3 a=(t.Sample(s,uv+float2(q.x,0)).rgb+t.Sample(s,uv-float2(q.x,0)).rgb+t.Sample(s,uv+float2(0,q.y)).rgb+t.Sample(s,uv-float2(0,q.y)).rgb)*.25; c.rgb=saturate(c.rgb+(c.rgb-a)*sharpness); c.a*=saturate((max(c.r,max(c.g,c.b))-threshold)/max(feather,.00001)); c.rgb*=c.a; return c; }
 """;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ShaderParams
-    {
-        public float Threshold;
-        public float Feather;
-        public float InvInputWidth;
-        public float InvInputHeight;
-        public float Sharpness;
-        public float Padding;
-        public float Padding1;
-        public float Padding2;
-    }
-
     private sealed class CaptureContext : IDisposable
     {
-        public CaptureContext(
-            IDXGIFactory1 factory,
-            ID3D11Device device,
-            ID3D11DeviceContext deviceContext,
-            IDXGIOutputDuplication duplication,
-            ID3D11Texture2D sourceTexture,
-            ID3D11ShaderResourceView sourceShaderResourceView,
-            ID3D11Texture2D outputTexture,
-            ID3D11RenderTargetView outputRenderTargetView,
-            ID3D11Texture2D outputStagingTexture,
-            ID3D11SamplerState linearSampler,
-            ID3D11VertexShader vertexShader,
-            ID3D11PixelShader pixelShader,
-            ID3D11Buffer shaderParamsBuffer,
-            int inputWidth,
-            int inputHeight,
-            int outputWidth,
-            int outputHeight)
-        {
-            Factory = factory;
-            Device = device;
-            DeviceContext = deviceContext;
-            Duplication = duplication;
-            SourceTexture = sourceTexture;
-            SourceShaderResourceView = sourceShaderResourceView;
-            OutputTexture = outputTexture;
-            OutputRenderTargetView = outputRenderTargetView;
-            OutputStagingTexture = outputStagingTexture;
-            LinearSampler = linearSampler;
-            VertexShader = vertexShader;
-            PixelShader = pixelShader;
-            ShaderParamsBuffer = shaderParamsBuffer;
-            InputWidth = inputWidth;
-            InputHeight = inputHeight;
-            OutputWidth = outputWidth;
-            OutputHeight = outputHeight;
-        }
-
-        public IDXGIFactory1 Factory { get; }
-        public ID3D11Device Device { get; }
-        public ID3D11DeviceContext DeviceContext { get; }
-        public IDXGIOutputDuplication Duplication { get; }
-        public ID3D11Texture2D SourceTexture { get; }
-        public ID3D11ShaderResourceView SourceShaderResourceView { get; }
-        public ID3D11Texture2D OutputTexture { get; }
-        public ID3D11RenderTargetView OutputRenderTargetView { get; }
-        public ID3D11Texture2D OutputStagingTexture { get; }
-        public ID3D11SamplerState LinearSampler { get; }
-        public ID3D11VertexShader VertexShader { get; }
-        public ID3D11PixelShader PixelShader { get; }
-        public ID3D11Buffer ShaderParamsBuffer { get; }
-        public int InputWidth { get; }
-        public int InputHeight { get; }
-        public int OutputWidth { get; }
-        public int OutputHeight { get; }
-
-        public void Dispose()
-        {
-            ShaderParamsBuffer.Dispose();
-            PixelShader.Dispose();
-            VertexShader.Dispose();
-            LinearSampler.Dispose();
-            OutputStagingTexture.Dispose();
-            OutputRenderTargetView.Dispose();
-            OutputTexture.Dispose();
-            SourceShaderResourceView.Dispose();
-            SourceTexture.Dispose();
-            Duplication.Dispose();
-            DeviceContext.Dispose();
-            Device.Dispose();
-            Factory.Dispose();
-        }
+        public readonly IDXGIFactory1 Factory; public readonly ID3D11Device Device; public readonly ID3D11DeviceContext DeviceContext; public readonly IDXGIOutputDuplication Duplication; public readonly ID3D11Texture2D SourceTexture; public ID3D11Texture2D? LegacyOutputTexture, LegacyStaging; public readonly ID3D11ShaderResourceView Srv; public ID3D11RenderTargetView? LegacyRtv; public readonly ID3D11SamplerState Sampler; public readonly ID3D11VertexShader Vs; public readonly ID3D11PixelShader Ps; public readonly ID3D11Buffer Params; public readonly int InputWidth, InputHeight, OutputWidth, OutputHeight;
+        public ShaderParams LastParams; public bool HasParams;
+        public CaptureContext(IDXGIFactory1 f, ID3D11Device d, ID3D11DeviceContext c, IDXGIOutputDuplication dup, int iw, int ih, int ow, int oh) { Factory=f; Device=d; DeviceContext=c; Duplication=dup; InputWidth=iw; InputHeight=ih; OutputWidth=ow; OutputHeight=oh; SourceTexture=d.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,(uint)iw,(uint)ih,1,1,BindFlags.ShaderResource,ResourceUsage.Default,CpuAccessFlags.None,1,0,ResourceOptionFlags.None)); Srv=d.CreateShaderResourceView(SourceTexture); Sampler=d.CreateSamplerState(SamplerDescription.LinearClamp); var vs=Compiler.Compile(ShaderSource,"VSMain","YarrOverlayGpu.hlsl","vs_4_0",ShaderFlags.OptimizationLevel3); var ps=Compiler.Compile(ShaderSource,"PSMain","YarrOverlayGpu.hlsl","ps_4_0",ShaderFlags.OptimizationLevel3); Vs=d.CreateVertexShader(vs.Span); Ps=d.CreatePixelShader(ps.Span); Params=d.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<ShaderParams>(),BindFlags.ConstantBuffer)); }
+        public void EnsureLegacyResources(){if(LegacyOutputTexture is not null)return;LegacyOutputTexture=Device.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,(uint)OutputWidth,(uint)OutputHeight,1,1,BindFlags.RenderTarget,ResourceUsage.Default,CpuAccessFlags.None,1,0,ResourceOptionFlags.None));LegacyRtv=Device.CreateRenderTargetView(LegacyOutputTexture);LegacyStaging=Device.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,(uint)OutputWidth,(uint)OutputHeight,1,1,BindFlags.None,ResourceUsage.Staging,CpuAccessFlags.Read,1,0,ResourceOptionFlags.None));}
+        public void Dispose(){ Params.Dispose(); Ps.Dispose(); Vs.Dispose(); Sampler.Dispose(); LegacyStaging?.Dispose(); LegacyRtv?.Dispose(); LegacyOutputTexture?.Dispose(); Srv.Dispose(); SourceTexture.Dispose(); Duplication.Dispose(); DeviceContext.Dispose(); Device.Dispose(); Factory.Dispose(); }
     }
 }

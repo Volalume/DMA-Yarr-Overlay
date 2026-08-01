@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="Overlay/Overlay.csproj" />
+  <Project Path="LatencyMarker/LatencyMarker.csproj" />
 </Solution>

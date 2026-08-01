@@ -26,6 +26,8 @@ internal sealed class SettingsWindow : Form
         LineAlignment = StringAlignment.Center
     };
     private string? _hoveredButton;
+    private readonly System.Windows.Forms.Timer _metricsTimer = new() { Interval = 250 };
+    private PerformanceDetailsWindow? _detailsWindow;
 
     public SettingsWindow(AppState state)
     {
@@ -33,8 +35,8 @@ internal sealed class SettingsWindow : Form
         _state.StateChanged += HandleStateChanged;
 
         Text = "YarrOverlay Control";
-        ClientSize = new Size(1260, 780);
-        MinimumSize = new Size(1260, 780);
+        ClientSize = new Size(1500, 920);
+        MinimumSize = new Size(1500, 920);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         MinimizeBox = true;
@@ -44,11 +46,13 @@ internal sealed class SettingsWindow : Form
         ForeColor = Color.Gainsboro;
 
         RegisterGlobalHotkeys();
+        _metricsTimer.Tick += (_, _) => Invalidate();
     }
 
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+        _metricsTimer.Start();
         Invalidate();
     }
 
@@ -143,6 +147,9 @@ internal sealed class SettingsWindow : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        _metricsTimer.Stop();
+        _metricsTimer.Dispose();
+        _detailsWindow?.Dispose();
         UnregisterGlobalHotkeys();
         _state.StateChanged -= HandleStateChanged;
         base.OnFormClosed(e);
@@ -179,26 +186,28 @@ internal sealed class SettingsWindow : Form
 
     private void DrawLayout(Graphics g)
     {
-        var left = new Rectangle(40, 120, 760, 610);
-        var rightTop = new Rectangle(828, 120, 392, 292);
-        var rightBottom = new Rectangle(828, 438, 392, 292);
+        var left = new Rectangle(40, 120, 760, 750);
+        var rightTop = new Rectangle(828, 120, 632, 410);
+        var rightBottom = new Rectangle(828, 556, 632, 314);
 
         DrawRoutingCard(g, left);
         DrawStatusCard(g, rightTop);
-        DrawTipsCard(g, rightBottom);
+        DrawPerformanceControls(g, rightBottom);
     }
 
     private void DrawRoutingCard(Graphics g, Rectangle card)
     {
-        DrawCard(g, card, "Routing + Keying", "Input/output assignment and black-key strength");
+        DrawCard(g, card, "Routing + Keying", "Capture/output assignment and black-key strength");
 
         var x = card.X + 28;
         var y = card.Y + 88;
 
-        DrawChooser(g, "Input Monitor", _state.CurrentInputMonitor.Name, "inputPrev", "inputNext", x, y, card.Width - 56);
+        DrawChooser(g, "Capture Display", _state.CurrentInputMonitor.Name, "inputPrev", "inputNext", x, y, card.Width - 56);
         y += 108;
-        DrawChooser(g, "Output Monitor", _state.CurrentOutputMonitor.Name, "outputPrev", "outputNext", x, y, card.Width - 56);
+        DrawChooser(g, "Output Display", _state.CurrentOutputMonitor.Name, "outputPrev", "outputNext", x, y, card.Width - 56);
         y += 118;
+        DrawScaling(g, x, y, card.Width - 56);
+        y += 82;
         DrawThreshold(g, x, y, card.Width - 56);
         y += 128;
         DrawSharpness(g, x, y, card.Width - 56);
@@ -209,6 +218,7 @@ internal sealed class SettingsWindow : Form
     private void DrawStatusCard(Graphics g, Rectangle card)
     {
         DrawCard(g, card, "Live Status", "Current route and transport health");
+        DrawButton(g,new Rectangle(card.Right-182,card.Y+22,158,40),"Full Metrics","metricsDetails",false);
 
         using var mainBrush = new SolidBrush(Color.FromArgb(232, 236, 240));
         using var dimBrush = new SolidBrush(Color.FromArgb(165, 172, 184));
@@ -216,40 +226,45 @@ internal sealed class SettingsWindow : Form
         using var warnBrush = new SolidBrush(Color.FromArgb(255, 140, 140));
         using var panelBrush = new SolidBrush(Color.FromArgb(18, 21, 27));
 
-        var inner = new Rectangle(card.X + 24, card.Y + 88, card.Width - 48, 146);
+        var inner = new Rectangle(card.X + 24, card.Y + 88, card.Width - 48, 100);
         FillRoundedRect(g, panelBrush, inner, 18);
 
-        g.DrawString("Route", _smallFont, dimBrush, inner.X + 18, inner.Y + 18);
-        g.DrawString($"{_state.CurrentInputMonitor.Name}", _bodyFont, mainBrush, new RectangleF(inner.X + 18, inner.Y + 40, inner.Width - 36, 24), _ellipsisFormat);
-        g.DrawString("to", _smallFont, dimBrush, inner.X + 18, inner.Y + 70);
-        g.DrawString($"{_state.CurrentOutputMonitor.Name}", _bodyFont, mainBrush, new RectangleF(inner.X + 18, inner.Y + 92, inner.Width - 36, 24), _ellipsisFormat);
+        g.DrawString("Capture", _smallFont, dimBrush, inner.X + 18, inner.Y + 16);
+        g.DrawString($"{_state.CurrentInputMonitor.Name}", _bodyFont, mainBrush, new RectangleF(inner.X + 92, inner.Y + 14, inner.Width - 110, 24), _ellipsisFormat);
+        g.DrawString("Output", _smallFont, dimBrush, inner.X + 18, inner.Y + 52);
+        g.DrawString($"{_state.CurrentOutputMonitor.Name}", _bodyFont, mainBrush, new RectangleF(inner.X + 92, inner.Y + 50, inner.Width - 110, 24), _ellipsisFormat);
 
-        g.DrawString($"FPS  {_state.CaptureFps}", _titleFont, _state.IsRunning ? okBrush : warnBrush, card.X + 24, card.Y + 242);
+        var perf = _state.Diagnostics.Performance ?? LatencyMetrics.Global.Snapshot();
+        var one = perf.OneSecond; var ten = perf.TenSeconds;
+        g.DrawString($"{_state.Diagnostics.PipelineMode}  | Capture {_state.CaptureFps} FPS | Submit {one.SubmitFps:F1} FPS", _smallFont, _state.IsRunning ? okBrush : warnBrush, card.X + 24, card.Y + 204);
+        var ago = _state.Diagnostics.LastFrameAt is null ? "no frame" : $"{(DateTimeOffset.Now - _state.Diagnostics.LastFrameAt.Value).TotalSeconds:F1}s ago";
+        g.DrawString($"Software submit ms: cur {F(ten.Pipeline.Current)} / avg {F(ten.Pipeline.Average)} / p95 {F(ten.Pipeline.P95)} / p99 {F(ten.Pipeline.P99)}", _smallFont, dimBrush, card.X + 24, card.Y + 230);
+        g.DrawString($"TOTAL APP LATENCY ESTIMATE: {F(perf.TotalAppLatencyEstimateMs)} ms", _titleFont, okBrush, card.X + 24, card.Y + 252);
+        g.DrawString($"Acquire {F(ten.AcquireWait.Average)} | Map {F(ten.MapWait.Average)} | CPU copy {F(ten.CpuCopy.Average)} | UI {F(ten.UiQueue.Average)} | Submit {F(ten.Submit.Average)} ms", _smallFont, dimBrush, card.X + 24, card.Y + 278);
+        g.DrawString($"Age {F(ten.FrameAge.Average)} | interval {F(ten.FrameInterval.Average)} | GPU copy/shader/total {F(ten.GpuCopy.Average)}/{F(ten.GpuShader.Average)}/{F(ten.GpuTotal.Average)} ms", _smallFont, dimBrush, card.X + 24, card.Y + 302);
+        g.DrawString($"Captured {perf.CapturedFrames} | Submitted {perf.SubmittedFrames} | Dropped {perf.DroppedFrames} | Replaced {perf.ReplacedFrames}", _smallFont, dimBrush, card.X + 24, card.Y + 326);
+        g.DrawString($"Accumulated Σ {perf.AccumulatedFrames}, max {perf.MaxAccumulatedFrames} | DXGI errors {perf.DxgiErrors} | recreates {_state.Diagnostics.RecreateCount}", _smallFont, dimBrush, card.X + 24, card.Y + 350);
+        g.DrawString($"Last {ago} | threads C/R {_state.Diagnostics.CaptureThreadId}/{_state.Diagnostics.RenderThreadId} | same GPU {_state.Diagnostics.SameAdapter} | CSV lost {_state.Diagnostics.CsvLostRows}", _smallFont, dimBrush, card.X + 24, card.Y + 374);
+        g.DrawString($"Recovery last/total {_state.Diagnostics.LastRecoveryMs:F1}/{_state.Diagnostics.TotalRecoveryMs:F1} ms | GC {_state.Diagnostics.Gen0}/{_state.Diagnostics.Gen1}/{_state.Diagnostics.Gen2} | WS {_state.Diagnostics.WorkingSetBytes/1048576.0:F1} MiB", _smallFont, dimBrush, card.X + 24, card.Y + 394);
     }
 
-    private void DrawTipsCard(Graphics g, Rectangle card)
+    private void DrawPerformanceControls(Graphics g, Rectangle card)
     {
-        DrawCard(g, card, "Controls", "Shortcuts and behavior");
-
-        using var textBrush = new SolidBrush(Color.FromArgb(210, 214, 220));
-        using var dimBrush = new SolidBrush(Color.FromArgb(160, 168, 180));
-
-        var lines = new[]
-        {
-            "Space  : start or stop overlay transport",
-            "+ / -  : raise or lower black-key threshold globally",
-            "Refresh: rescan monitors after display topology changes",
-            "Output window stays topmost and click-through for in-game use"
-        };
-
-        var y = card.Y + 92;
-        foreach (var line in lines)
-        {
-            g.DrawString(line, _bodyFont, textBrush, new RectangleF(card.X + 24, y, card.Width - 48, 34));
-            y += 42;
-        }
-
-        g.DrawString($"Status: {_state.StatusText}", _smallFont, dimBrush, new RectangleF(card.X + 24, card.Bottom - 44, card.Width - 48, 22), _ellipsisFormat);
+        DrawCard(g, card, "Latency + Diagnostics", "Pipeline, instrumentation, scheduler and test options");
+        var x=card.X+24; var y=card.Y+90; var w=180; var gap=12;
+        DrawButton(g,new Rectangle(x,y,w,44),$"Pipeline: {_state.PipelineMode}","pipeline",false);
+        DrawButton(g,new Rectangle(x+w+gap,y,w,44),$"HUD: {_state.PerformanceHud}","hud",false);
+        DrawButton(g,new Rectangle(x+(w+gap)*2,y,w,44),$"Metrics: {_state.MetricsMode}","metrics",false);
+        y+=60;
+        DrawButton(g,new Rectangle(x,y,w,44),$"Priority: {_state.CapturePriority}","priority",false);
+        DrawButton(g,new Rectangle(x+w+gap,y,w,44),$"MMCSS: {(_state.MmcssEnabled?"On":"Off")}","mmcss",false);
+        DrawButton(g,new Rectangle(x+(w+gap)*2,y,w,44),$"CSV: {(_state.CsvEnabled?"On":"Off")}","csv",false);
+        y+=60;
+        DrawButton(g,new Rectangle(x,y,w,44),$"Latency Test: {(_state.LatencyTestMode?"On":"Off")}","latencyTest",false);
+        DrawButton(g,new Rectangle(x+w+gap,y,w,44),$"Max latency: {_state.MaximumFrameLatency}","maxLatency",false);
+        DrawButton(g,new Rectangle(x+(w+gap)*2,y,w,44),$"CSV every: {_state.CsvIntervalFrames}","csvInterval",false);
+        using var dim=new SolidBrush(Color.FromArgb(160,168,180));
+        g.DrawString($"Present: {_state.PresentMode}. Detailed GPU queries are collected eight frames later without blocking.",_smallFont,dim,new RectangleF(x,y+60,card.Width-48,44));
     }
 
     private void DrawCard(Graphics g, Rectangle rect, string title, string subtitle)
@@ -318,6 +333,17 @@ internal sealed class SettingsWindow : Form
         DrawButton(g, rightRect, "+", "thresholdUp", true);
 
         g.DrawString("0 keeps more shadow detail, 80 removes darker pixels more aggressively.", _smallFont, dimBrush, x, rowY + 66);
+    }
+
+    private static string F(double value) => double.IsNaN(value) ? "N/A" : value.ToString("F2");
+
+    private void DrawScaling(Graphics g, int x, int y, int width)
+    {
+        using var label = new SolidBrush(Color.FromArgb(210, 214, 220));
+        using var dim = new SolidBrush(Color.FromArgb(160, 168, 180));
+        g.DrawString("Scaling Mode", _bodyFont, label, x, y);
+        DrawButton(g, new Rectangle(x, y + 30, 220, 44), _state.ScalingMode.ToString(), "scaling", false);
+        g.DrawString("Stretch / Fit letterbox / Fill crop", _smallFont, dim, x + 240, y + 45);
     }
 
     private void DrawTransport(Graphics g, int x, int y, int width)
@@ -416,6 +442,22 @@ internal sealed class SettingsWindow : Form
             case "sharpnessUp":
                 _state.IncreaseSharpness(2);
                 break;
+            case "scaling":
+                _state.CycleScalingMode();
+                break;
+            case "pipeline": _state.CyclePipelineMode(); break;
+            case "hud": _state.CycleHudMode(); break;
+            case "metrics": _state.CycleMetricsMode(); break;
+            case "priority": _state.CyclePriority(); break;
+            case "mmcss": _state.ToggleMmcss(); break;
+            case "csv": _state.ToggleCsv(); break;
+            case "maxLatency": _state.CycleMaximumFrameLatency(); break;
+            case "csvInterval": _state.CycleCsvInterval(); break;
+            case "metricsDetails":
+                if(_detailsWindow is null||_detailsWindow.IsDisposed)_detailsWindow=new PerformanceDetailsWindow(_state);
+                if(!_detailsWindow.Visible)_detailsWindow.Show(this);else _detailsWindow.BringToFront();
+                break;
+            case "latencyTest": _state.ToggleLatencyTest(); break;
         }
     }
 

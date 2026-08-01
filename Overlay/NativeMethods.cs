@@ -10,6 +10,7 @@ internal static class NativeMethods
     public const int WsExTransparent = 0x00000020;
     public const int WsExToolWindow = 0x00000080;
     public const int WsExNoActivate = 0x08000000;
+    public const int WsExNoRedirectionBitmap = 0x00200000;
     public const int UlwAlpha = 0x00000002;
     public const byte AcSrcAlpha = 0x01;
     public const int HwndTopmost = -1;
@@ -26,6 +27,16 @@ internal static class NativeMethods
     public const int StretchHalftone = 4;
     public const uint DibRgbColors = 0;
     public const int BiRgb = 0;
+    public const int EnumCurrentSettings = -1;
+
+    [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr AvSetMmThreadCharacteristics(string taskName, out uint taskIndex);
+
+    [DllImport("avrt.dll", SetLastError = true)]
+    public static extern bool AvRevertMmThreadCharacteristics(IntPtr handle);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref DevMode lpDevMode);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool UpdateLayeredWindow(
@@ -171,5 +182,17 @@ internal static class NativeMethods
     {
         public BitmapInfoHeader bmiHeader;
         public uint bmiColors;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DevMode
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels; public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
     }
 }

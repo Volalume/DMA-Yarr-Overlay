@@ -10,6 +10,7 @@ internal sealed class OverlayHost : IDisposable
     private readonly Thread _thread;
     private readonly ManualResetEventSlim _ready = new(false);
     private OverlayWindow? _window;
+    private PerformanceHudWindow? _hud;
     private ApplicationContext? _context;
     private bool _disposed;
 
@@ -28,7 +29,19 @@ internal sealed class OverlayHost : IDisposable
 
     public void SetMonitor(MonitorInfo monitor)
     {
-        InvokeOnWindow(() => _window!.SetMonitor(monitor));
+        InvokeOnWindow(() => { _window!.SetMonitor(monitor); _hud!.SetMonitor(monitor); });
+    }
+
+    public void SetHudMode(PerformanceHudMode mode, bool running) => InvokeOnWindow(() => _hud!.SetMode(mode, running));
+
+    public IntPtr OverlayHandle
+    {
+        get
+        {
+            var handle = IntPtr.Zero;
+            InvokeOnWindow(() => handle = _window!.Handle);
+            return handle;
+        }
     }
 
     public void ShowOverlay()
@@ -46,7 +59,7 @@ internal sealed class OverlayHost : IDisposable
         _window?.ClearFrame();
     }
 
-    public void SetFrame(Bitmap frame)
+    public void SetFrame(FrameEnvelope frame)
     {
         _window?.SetFrame(frame);
     }
@@ -67,6 +80,7 @@ internal sealed class OverlayHost : IDisposable
                 _window.BeginInvoke(new Action(() =>
                 {
                     _window.Dispose();
+                    _hud?.Dispose();
                     _context?.ExitThread();
                 }));
             }
@@ -90,6 +104,7 @@ internal sealed class OverlayHost : IDisposable
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
 
         _window = new OverlayWindow();
+        _hud = new PerformanceHudWindow();
         _ = _window.Handle;
         _context = new ApplicationContext();
         _ready.Set();

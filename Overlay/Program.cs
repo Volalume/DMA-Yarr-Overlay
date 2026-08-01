@@ -23,6 +23,8 @@ internal static class Program
 
         using var state = new AppState();
         using var settingsWindow = new SettingsWindow(state);
+        if (Array.Exists(Environment.GetCommandLineArgs(), a => string.Equals(a, "--autostart", StringComparison.OrdinalIgnoreCase)))
+            settingsWindow.Shown += (_, _) => state.Start();
         Application.Run(settingsWindow);
     }
 }

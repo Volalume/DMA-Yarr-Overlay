@@ -9,11 +9,12 @@ namespace Overlay;
 internal sealed class OverlayWindow : Form
 {
     private readonly object _frameSync = new();
-    private Bitmap? _currentFrame;
+    private FrameEnvelope? _currentFrame;
     private MonitorInfo? _monitor;
     private int _renderQueued;
     private int _frameVersion;
     private int _renderedVersion;
+    private IntPtr _legacyMemoryDc;
 
     public OverlayWindow()
     {
@@ -31,7 +32,8 @@ internal sealed class OverlayWindow : Form
             cp.ExStyle |= NativeMethods.WsExLayered
                 | NativeMethods.WsExTransparent
                 | NativeMethods.WsExToolWindow
-                | NativeMethods.WsExNoActivate;
+                | NativeMethods.WsExNoActivate
+                | NativeMethods.WsExNoRedirectionBitmap;
             return cp;
         }
     }
@@ -90,7 +92,7 @@ internal sealed class OverlayWindow : Form
         }
     }
 
-    public void SetFrame(Bitmap frame)
+    public void SetFrame(FrameEnvelope frame)
     {
         if (IsDisposed)
         {
@@ -100,8 +102,15 @@ internal sealed class OverlayWindow : Form
 
         lock (_frameSync)
         {
-            _currentFrame?.Dispose();
+            if (_currentFrame is not null)
+            {
+                _currentFrame.Timing.FrameDroppedOrReplaced = FrameTiming.Now;
+                _currentFrame.Dispose();
+                if (_currentFrame.MetricsEnabled) LatencyMetrics.Global.RecordReplaced();
+            }
+            frame.Timing.OverlayFrameReceived = FrameTiming.Now;
             _currentFrame = frame;
+            if (frame.MetricsEnabled) LatencyMetrics.Global.SetQueueLength(1);
             _frameVersion++;
         }
 
@@ -119,6 +128,7 @@ internal sealed class OverlayWindow : Form
         if (disposing)
         {
             ClearFrame();
+            if (_legacyMemoryDc != IntPtr.Zero) { NativeMethods.DeleteDC(_legacyMemoryDc); _legacyMemoryDc = IntPtr.Zero; }
         }
 
         base.Dispose(disposing);
@@ -126,7 +136,8 @@ internal sealed class OverlayWindow : Form
 
     private void RenderFrame()
     {
-        Bitmap? frame = null;
+        LatencyMetrics.Global.RenderThreadId = Environment.CurrentManagedThreadId;
+        FrameEnvelope? envelope = null;
         MonitorInfo? monitor;
         var version = 0;
 
@@ -138,14 +149,22 @@ internal sealed class OverlayWindow : Form
                 return;
             }
 
-            frame = CreateRenderFrame(_currentFrame, _monitor.Bounds.Size);
+            envelope = _currentFrame;
+            _currentFrame = null; // hand ownership to the only queued render; new arrivals replace only unsubmitted frames.
+            if (envelope.MetricsEnabled) LatencyMetrics.Global.SetQueueLength(0);
             monitor = _monitor;
             version = _frameVersion;
         }
 
+        envelope.Timing.UiRenderStarted = FrameTiming.Now;
+        var frame = envelope.Bitmap;
+
         var screenDc = NativeMethods.GetDC(IntPtr.Zero);
-        var memDc = NativeMethods.CreateCompatibleDC(screenDc);
+        if (_legacyMemoryDc == IntPtr.Zero) _legacyMemoryDc = NativeMethods.CreateCompatibleDC(IntPtr.Zero);
+        var memDc = _legacyMemoryDc;
+        envelope.Timing.HBitmapStarted = FrameTiming.Now;
         var hBitmap = frame.GetHbitmap(Color.FromArgb(0));
+        envelope.Timing.HBitmapReturned = FrameTiming.Now;
         var oldBitmap = NativeMethods.SelectObject(memDc, hBitmap);
 
         try
@@ -161,6 +180,7 @@ internal sealed class OverlayWindow : Form
                 AlphaFormat = NativeMethods.AcSrcAlpha
             };
 
+            envelope.Timing.UpdateLayeredWindowStarted = FrameTiming.Now;
             NativeMethods.UpdateLayeredWindow(
                 Handle,
                 screenDc,
@@ -171,14 +191,17 @@ internal sealed class OverlayWindow : Form
                 0,
                 ref blend,
                 NativeMethods.UlwAlpha);
+            envelope.Timing.UpdateLayeredWindowReturned = FrameTiming.Now;
         }
         finally
         {
             NativeMethods.SelectObject(memDc, oldBitmap);
             NativeMethods.DeleteObject(hBitmap);
-            NativeMethods.DeleteDC(memDc);
             NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
-            frame.Dispose();
+            envelope.Dispose();
+            if (envelope.MetricsEnabled) LatencyMetrics.Global.RecordSubmitted(envelope.Timing);
+            if (envelope.Csv is not null && envelope.Timing.FrameId % envelope.CsvInterval == 0)
+                envelope.Csv.TryWrite(envelope.Timing, envelope.Pipeline, envelope.InputAdapter, envelope.OutputAdapter, 0, 0);
             _renderedVersion = version;
             Interlocked.Exchange(ref _renderQueued, 0);
         }
@@ -211,25 +234,4 @@ internal sealed class OverlayWindow : Form
         }
     }
 
-    private static Bitmap CreateRenderFrame(Bitmap source, Size targetSize)
-    {
-        if (source.Width == targetSize.Width && source.Height == targetSize.Height)
-        {
-            return (Bitmap)source.Clone();
-        }
-
-        var scaled = new Bitmap(targetSize.Width, targetSize.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-
-        using (var g = Graphics.FromImage(scaled))
-        {
-            g.CompositingMode = CompositingMode.SourceCopy;
-            g.CompositingQuality = CompositingQuality.HighSpeed;
-            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-            g.PixelOffsetMode = PixelOffsetMode.Half;
-            g.SmoothingMode = SmoothingMode.HighSpeed;
-            g.DrawImage(source, new Rectangle(0, 0, targetSize.Width, targetSize.Height));
-        }
-
-        return scaled;
-    }
 }
