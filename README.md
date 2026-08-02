@@ -135,6 +135,5 @@ dotnet run --project Overlay -c Release -- --autostart
 
 ### Additional Screenshots
 
-![YarrOverlay Control Window](./imgs/1.png)
 ![YarrOverlay Overlay Output](./imgs/2.png)
 ![YarrOverlay Overlay](./imgs/3.png)
