@@ -47,7 +47,15 @@ internal sealed class SettingsWindow : Form
     {
         base.OnHandleCreated(e);
         _uiScale = Math.Max(1f, DeviceDpi / 96f);
-        _controller = new ImGuiD3D11Controller(Handle, ClientSize.Width, ClientSize.Height, DeviceDpi / 96f);
+        try
+        {
+            _controller = new ImGuiD3D11Controller(Handle, ClientSize.Width, ClientSize.Height, DeviceDpi / 96f);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"ImGui initialization failed: {ex}");
+            throw;
+        }
         _hotkeys = new HotkeyManager(Handle);
         _hotkeys.RegisterThresholdHotkeys();
         if (!_hotkeys.TrySetUiHotkey(_state.UiHotkey)) _notification = _hotkeys.LastError;

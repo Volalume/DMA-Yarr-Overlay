@@ -1,4 +1,12 @@
 .vs/
+.vscode/
 **/bin/
 **/obj/
+publish/
+TestResults/
 *.user
+*.suo
+*.userosscache
+*.sln.docstates
+YarrOverlay.log
+YarrOverlay.settings.json

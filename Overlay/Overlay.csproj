@@ -14,6 +14,7 @@
     <PublishSelfContained>true</PublishSelfContained>
     <SelfContained>true</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugSymbols>false</DebugSymbols>
     <DebugType>None</DebugType>
