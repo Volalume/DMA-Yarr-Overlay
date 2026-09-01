@@ -127,7 +127,7 @@ dotnet run --project Overlay -c Release -- --autostart
 
 ![Latest YarrOverlay control panel1](./imgs/Overlay.png)
 ![Latest YarrOverlay control panel2](./imgs/Per.png)
-![Latest YarrOverlay control panel2](./Set/Per.png)
+![Latest YarrOverlay control panel2](./imgs/Set.png)
 
 ### Overlay Output Examples
 
