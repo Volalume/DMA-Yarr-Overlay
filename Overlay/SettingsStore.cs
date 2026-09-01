@@ -28,7 +28,7 @@ internal sealed class AppSettings
     public bool AllowSameDisplay { get; set; }
     public bool DebugOverlay { get; set; }
     public PipelineMode PipelineMode { get; set; } = PipelineMode.Auto;
-    public PerformanceHudMode PerformanceHud { get; set; } = PerformanceHudMode.Off;
+    public PerformanceHudMode PerformanceHud { get; set; } = PerformanceHudMode.Basic;
     public MetricsMode MetricsCollection { get; set; } = MetricsMode.Lightweight;
     public int MaximumFrameLatency { get; set; } = 1;
     public PresentMode PresentMode { get; set; } = PresentMode.Immediate;
@@ -38,20 +38,30 @@ internal sealed class AppSettings
     public int CsvIntervalFrames { get; set; } = 1;
     public bool LatencyTestMode { get; set; }
     public bool AlwaysOnTop { get; set; } = true;
-    public int UiHotkeyKey { get; set; } = (int)Keys.F8;
+    public int UiHotkeyKey { get; set; } = (int)Keys.Insert;
     public uint UiHotkeyModifiers { get; set; }
 }
 internal static class SettingsStore
 {
-    private static readonly string Path = System.IO.Path.Combine(AppContext.BaseDirectory, "YarrOverlay.settings.json");
     private static readonly object SaveSync = new();
     private static readonly System.Threading.Timer SaveTimer = new(_ => Flush(), null, Timeout.Infinite, Timeout.Infinite);
     private static string? _pendingJson;
 
     public static AppSettings Load()
     {
-        if (!File.Exists(Path)) return new AppSettings();
-        try { return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(Path)) ?? new AppSettings(); }
+        var path = File.Exists(AppPaths.SettingsFile) ? AppPaths.SettingsFile : AppPaths.LegacySettingsFile;
+        if (!File.Exists(path)) return new AppSettings();
+        try
+        {
+            var json = File.ReadAllText(path);
+            var settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+            if (!string.Equals(path, AppPaths.SettingsFile, StringComparison.OrdinalIgnoreCase))
+            {
+                AppPaths.EnsureDataDirectory();
+                File.WriteAllText(AppPaths.SettingsFile, json);
+            }
+            return settings;
+        }
         catch (Exception ex) { Logger.Error($"Settings load failed: {ex.Message}"); return new AppSettings(); }
     }
     public static void Save(AppSettings settings)
@@ -74,7 +84,11 @@ internal static class SettingsStore
         }
 
         if (json is null) return;
-        try { File.WriteAllText(Path, json); }
+        try
+        {
+            AppPaths.EnsureDataDirectory();
+            File.WriteAllText(AppPaths.SettingsFile, json);
+        }
         catch (Exception ex) { Logger.Error($"Settings save failed: {ex.Message}"); }
     }
 }

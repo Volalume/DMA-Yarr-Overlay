@@ -25,7 +25,7 @@ internal sealed class AppState : IDisposable
         ScalingMode = _settings.ScalingMode;
         var savedHotkey = new HotkeyBinding((Keys)_settings.UiHotkeyKey, _settings.UiHotkeyModifiers);
         UiHotkey = savedHotkey.Key is Keys.None or Keys.ControlKey or Keys.ShiftKey or Keys.Menu or Keys.LWin or Keys.RWin
-            ? new HotkeyBinding(Keys.F8, 0)
+            ? new HotkeyBinding(Keys.Insert, 0)
             : savedHotkey;
         _capture.FrameReady += HandleFrameReady;
         _capture.DiagnosticsChanged += diagnostics => { Diagnostics = diagnostics; StateChanged?.Invoke(); };

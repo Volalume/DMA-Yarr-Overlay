@@ -65,19 +65,16 @@ internal sealed class PerformanceHudWindow : Form
         var p=LatencyMetrics.Global.Snapshot(); var w=p.TenSeconds; var y=10f;
         if(_mode==PerformanceHudMode.Basic)
         {
-            DrawBasicBox(e.Graphics, $"YarrOverlay | {FBasic(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms");
+            DrawBasicBox(e.Graphics, $"YarrOverlay | {LatencyFormatter.Milliseconds(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms");
             return;
         }
         void Line(string s){e.Graphics.DrawString(s,_font,Brushes.White,10,y);y+=20;}
         Line($"YarrOverlay | submit {w.SubmitFps:F1} fps | queue {p.QueueLength}/{p.MaxQueueLength}");
-        e.Graphics.DrawString($"TOTAL APP LATENCY  {F(p.TotalAppLatencyEstimateMs)} ms  (estimate)",_totalFont,Brushes.LightGreen,10,y);y+=30;
-        Line($"software submit  {F(w.Pipeline.Current)} cur  {F(w.Pipeline.Average)} avg  {F(w.Pipeline.P95)} p95 ms");
-        if(_mode==PerformanceHudMode.Detailed){Line($"age {F(w.FrameAge.Average)} interval {F(w.FrameInterval.Average)} acquire {F(w.AcquireWait.Average)} map {F(w.MapWait.Average)}");Line($"CPU copy {F(w.CpuCopy.Average)} UI {F(w.UiQueue.Average)} GPU copy/shader/total {F(w.GpuCopy.Average)}/{F(w.GpuShader.Average)}/{F(w.GpuTotal.Average)}");Line($"captured {p.CapturedFrames} submitted {p.SubmittedFrames} dropped {p.DroppedFrames} replaced {p.ReplacedFrames}");Line($"accumulated {p.AccumulatedFrames} max {p.MaxAccumulatedFrames} DXGI errors {p.DxgiErrors}");}
+        e.Graphics.DrawString($"TOTAL APP LATENCY  {LatencyFormatter.Milliseconds(p.TotalAppLatencyEstimateMs)} ms  (estimate)",_totalFont,Brushes.LightGreen,10,y);y+=30;
+        Line($"software submit  {LatencyFormatter.Milliseconds(w.Pipeline.Current)} cur  {LatencyFormatter.Milliseconds(w.Pipeline.Average)} avg  {LatencyFormatter.Milliseconds(w.Pipeline.P95)} p95 ms");
+        if(_mode==PerformanceHudMode.Detailed){Line($"age {LatencyFormatter.Milliseconds(w.FrameAge.Average)} interval {LatencyFormatter.Milliseconds(w.FrameInterval.Average)} acquire {LatencyFormatter.Milliseconds(w.AcquireWait.Average)} map {LatencyFormatter.Milliseconds(w.MapWait.Average)}");Line($"CPU copy {LatencyFormatter.Milliseconds(w.CpuCopy.Average)} UI {LatencyFormatter.Milliseconds(w.UiQueue.Average)} GPU copy/shader/total {LatencyFormatter.Milliseconds(w.GpuCopy.Average)}/{LatencyFormatter.Milliseconds(w.GpuShader.Average)}/{LatencyFormatter.Milliseconds(w.GpuTotal.Average)}");Line($"captured {p.CapturedFrames} submitted {p.SubmittedFrames} dropped {p.DroppedFrames} replaced {p.ReplacedFrames}");Line($"accumulated {p.AccumulatedFrames} max {p.MaxAccumulatedFrames} DXGI errors {p.DxgiErrors}");}
     }
     protected override void Dispose(bool disposing){if(disposing){_timer.Dispose();_font.Dispose();_totalFont.Dispose();}base.Dispose(disposing);}
-    private static string F(double v)=>double.IsNaN(v)?"N/A":v.ToString("F2");
-    private static string FBasic(double v)=>double.IsNaN(v)?"N/A":v.ToString("F0");
-
     private double PresentBasicLatency(double raw)
     {
         if (double.IsNaN(raw) || double.IsInfinity(raw)) return raw;

@@ -14,6 +14,8 @@ internal static class NativeMethods
     public const int UlwAlpha = 0x00000002;
     public const byte AcSrcAlpha = 0x01;
     public const int HwndTopmost = -1;
+    public const int HwndTop = 0;
+    public const int HwndBroadcast = 0xffff;
     public const uint SwpNoActivate = 0x0010;
     public const uint SwpNoSize = 0x0001;
     public const uint SwpNoMove = 0x0002;
@@ -38,6 +40,7 @@ internal static class NativeMethods
     public const uint DibRgbColors = 0;
     public const int BiRgb = 0;
     public const int EnumCurrentSettings = -1;
+    public static readonly int WmShowSettings = RegisterWindowMessage("YarrOverlay.ShowSettings.v1");
 
     [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr AvSetMmThreadCharacteristics(string taskName, out uint taskIndex);
@@ -78,6 +81,33 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegisterWindowMessage(string messageName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostMessage(IntPtr hWnd, int message, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll")]
     public static extern bool ReleaseCapture();

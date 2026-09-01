@@ -30,7 +30,8 @@ internal sealed class PerformanceCsvWriter : IDisposable
     }
     private void WriteLoop()
     {
-        var path = Path.Combine(AppContext.BaseDirectory, $"YarrOverlay-metrics-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.csv");
+        AppPaths.EnsureDataDirectory();
+        var path = Path.Combine(AppPaths.DataDirectory, $"YarrOverlay-metrics-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.csv");
         using var writer = new StreamWriter(path, false);
         writer.WriteLine("FrameId,AcquireStart,AcquireReturned,DesktopPresent,MouseUpdate,SourceCopySubmitted,ShaderSubmitted,StagingCopySubmitted,MapStarted,MapReturned,CpuCopyStarted,CpuCopyFinished,FrameEventRaised,OverlayReceived,UiRenderStarted,HBitmapStarted,HBitmapReturned,SubmitStarted,SubmitReturned,DroppedOrReplaced,AccumulatedFrames,MetadataBytes,PointerVisible,ProtectedMasked,AcquireWaitMs,PipelineMs,DesktopToSubmitMs,MapWaitMs,CpuCopyMs,UiQueueMs,HBitmapMs,SubmitMs,GpuCopyMs,GpuShaderMs,GpuTotalMs,PresentCount,PresentRefreshCount,SyncRefreshCount,PresentSyncQpc,Pipeline,InputAdapter,OutputAdapter,DxgiResult,PresentResult");
         while (!_stopping || Volatile.Read(ref _queued) > 0)

@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace Overlay;
@@ -9,6 +10,13 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        using var singleInstance = new Mutex(true, @"Local\YarrOverlay.SingleInstance", out var isFirstInstance);
+        if (!isFirstInstance)
+        {
+            NativeMethods.PostMessage(new IntPtr(NativeMethods.HwndBroadcast), NativeMethods.WmShowSettings, IntPtr.Zero, IntPtr.Zero);
+            return;
+        }
+
         try
         {
             Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;

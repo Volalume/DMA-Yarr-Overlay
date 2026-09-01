@@ -21,7 +21,8 @@ internal sealed class SettingsWindow : Form
     private long _lastThresholdRepeat;
     private int _lastThresholdHotkeyId;
     private int _requestedClientHeight = 630;
-    private float _uiScale = 1f;
+    private IntPtr _previousForegroundWindow;
+    private bool _changingVisibility;
     private bool _disposed;
 
     public SettingsWindow(AppState state)
@@ -46,7 +47,6 @@ internal sealed class SettingsWindow : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        _uiScale = Math.Max(1f, DeviceDpi / 96f);
         try
         {
             _controller = new ImGuiD3D11Controller(Handle, ClientSize.Width, ClientSize.Height, DeviceDpi / 96f);
@@ -79,10 +79,7 @@ internal sealed class SettingsWindow : Form
         BeginInvoke(new Action(() =>
         {
             if (IsDisposed) return;
-            Show();
-            BringToFront();
-            Activate();
-            NativeMethods.SetForegroundWindow(Handle);
+            ActivateForInteraction();
         }));
     }
 
@@ -115,7 +112,13 @@ internal sealed class SettingsWindow : Form
         base.OnVisibleChanged(e);
         if (_controller is null) return;
         if (Visible && WindowState != FormWindowState.Minimized) _renderTimer.Start();
-        else _renderTimer.Stop();
+        else
+        {
+            _renderTimer.Stop();
+            Capture = false;
+            NativeMethods.ReleaseCapture();
+            Cursor.Clip = Rectangle.Empty;
+        }
     }
 
     protected override void OnResize(EventArgs e)
@@ -187,12 +190,19 @@ internal sealed class SettingsWindow : Form
 
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == NativeMethods.WmShowSettings)
+        {
+            ShowSettings();
+            return;
+        }
+
         if (m.Msg == NativeMethods.WmHotkey)
         {
             var id = m.WParam.ToInt32();
             if (id == NativeMethods.HotkeyIncrease) _state.IncreaseThreshold(GetThresholdHotkeyStep(id));
             else if (id == NativeMethods.HotkeyDecrease) _state.IncreaseThreshold(-GetThresholdHotkeyStep(id));
             else if (_hotkeys?.IsUiHotkey(id) == true) ToggleSettingsVisibility();
+            return;
         }
 
         _controller?.ProcessWindowMessage(ref m);
@@ -245,14 +255,14 @@ internal sealed class SettingsWindow : Form
 
             if (ImGui.BeginTabItem("Performance"))
             {
-                RequestClientHeight(1000);
+                RequestClientHeight(1100);
                 DrawPerformanceTab();
                 ImGui.EndTabItem();
             }
 
             if (ImGui.BeginTabItem("Settings"))
             {
-                RequestClientHeight(680);
+                RequestClientHeight(700);
                 DrawSettingsTab();
                 ImGui.EndTabItem();
             }
@@ -269,6 +279,8 @@ internal sealed class SettingsWindow : Form
     {
         var headerY = ImGui.GetCursorPosY();
         ImGui.TextColored(ImGuiTheme.Accent, "YARROVERLAY");
+        ImGui.SameLine();
+        ImGui.TextDisabled("https://github.com/Volalume/DMA-Yarr-Overlay");
         var status = _state.IsRunning ? "RUNNING" : "STOPPED";
         var statusColor = _state.IsRunning ? ImGuiTheme.Good : ImGuiTheme.Warning;
         ImGui.SameLine(ImGui.GetWindowWidth() - 138);
@@ -310,7 +322,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("ImageCard", 250, "IMAGE PROCESSING");
+        BeginCard("ImageCard", 220, "IMAGE PROCESSING");
         var scaling = (int)_state.ScalingMode;
         ImGui.SetNextItemWidth(-190);
         if (ImGui.Combo("Scaling", ref scaling, "Stretch\0Fit\0Fill\0")) RunUiAction(() => _state.SetScalingMode((ScalingMode)scaling));
@@ -331,8 +343,6 @@ internal sealed class SettingsWindow : Form
             RunUiAction(_state.RefreshMonitors);
             _notification ??= "Display topology refreshed.";
         }
-        ImGui.SameLine();
-        ImGui.TextDisabled(_state.StatusText);
     }
 
     private void DrawPerformanceTab()
@@ -435,10 +445,10 @@ internal sealed class SettingsWindow : Form
         ImGui.Text("UI Hotkey");
         ImGui.SameLine();
         var buttonText = _bindingHotkey ? "Press a key..." : $"[ {_state.UiHotkey.DisplayText} ]";
-        if (ImGui.Button(buttonText, new Vector2(220, 38)))
+        if (ImGui.Button(buttonText, new Vector2(80, 38)))
         {
             _bindingHotkey = true;
-            _notification = "Press a key combination; Escape cancels.";
+            _notification = "Press a key; Escape cancels.";
         }
         if (!string.IsNullOrWhiteSpace(_hotkeys?.LastError)) ImGui.TextColored(ImGuiTheme.Warning, _hotkeys.LastError);
         ImGui.EndChild();
@@ -457,7 +467,7 @@ internal sealed class SettingsWindow : Form
     {
         ImGui.BeginChild(
             id,
-            new Vector2(0, height * _uiScale),
+            new Vector2(0, height),
             ImGuiChildFlags.Borders,
             ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
         ImGui.TextColored(ImGuiTheme.Accent, title);
@@ -485,6 +495,7 @@ internal sealed class SettingsWindow : Form
         ImGui.SetCursorPosY(Math.Max(ImGui.GetCursorPosY(), ImGui.GetWindowHeight() - height - 10));
         ImGui.Separator();
         if (!string.IsNullOrWhiteSpace(_notification)) ImGui.TextDisabled(_notification);
+        ImGui.TextDisabled(_state.StatusText);
     }
 
     private void RefreshPerformanceSnapshot()
@@ -497,22 +508,87 @@ internal sealed class SettingsWindow : Form
 
     private void ToggleSettingsVisibility()
     {
-        if (Visible)
-        {
-            Hide();
-            return;
-        }
+        if (_changingVisibility) return;
+        if (Visible) HideSettings();
+        else ShowSettings();
+    }
 
-        Show();
-        WindowState = FormWindowState.Normal;
-        BringToFront();
-        Activate();
-        NativeMethods.SetForegroundWindow(Handle);
+    private void HideSettings()
+    {
+        _changingVisibility = true;
+        try
+        {
+            Capture = false;
+            NativeMethods.ReleaseCapture();
+            Cursor.Clip = Rectangle.Empty;
+            Hide();
+            if (_previousForegroundWindow != IntPtr.Zero && NativeMethods.IsWindow(_previousForegroundWindow))
+                NativeMethods.SetForegroundWindow(_previousForegroundWindow);
+        }
+        finally
+        {
+            _changingVisibility = false;
+        }
+    }
+
+    private void ShowSettings()
+    {
+        if (_changingVisibility) return;
+        _changingVisibility = true;
+        try
+        {
+            var foreground = NativeMethods.GetForegroundWindow();
+            if (foreground != IntPtr.Zero && foreground != Handle) _previousForegroundWindow = foreground;
+            Cursor.Clip = Rectangle.Empty;
+            Show();
+            WindowState = FormWindowState.Normal;
+            TopMost = _state.AlwaysOnTop;
+            ActivateForInteraction();
+        }
+        finally
+        {
+            _changingVisibility = false;
+        }
+    }
+
+    private void ActivateForInteraction()
+    {
+        if (!Visible || !IsHandleCreated) return;
+
+        var foreground = NativeMethods.GetForegroundWindow();
+        if (foreground != IntPtr.Zero && foreground != Handle) _previousForegroundWindow = foreground;
+        var foregroundThread = foreground == IntPtr.Zero
+            ? 0u
+            : NativeMethods.GetWindowThreadProcessId(foreground, out _);
+        var currentThread = NativeMethods.GetCurrentThreadId();
+        var attached = foregroundThread != 0 && foregroundThread != currentThread &&
+                       NativeMethods.AttachThreadInput(currentThread, foregroundThread, true);
+
+        try
+        {
+            Cursor.Clip = Rectangle.Empty;
+            NativeMethods.SetWindowPos(
+                Handle,
+                new IntPtr(_state.AlwaysOnTop ? NativeMethods.HwndTopmost : NativeMethods.HwndTop),
+                0,
+                0,
+                0,
+                0,
+                NativeMethods.SwpNoMove | NativeMethods.SwpNoSize | NativeMethods.SwpShowWindow);
+            NativeMethods.BringWindowToTop(Handle);
+            NativeMethods.SetForegroundWindow(Handle);
+            NativeMethods.SetFocus(Handle);
+            Activate();
+            Focus();
+        }
+        finally
+        {
+            if (attached) NativeMethods.AttachThreadInput(currentThread, foregroundThread, false);
+        }
     }
 
     private void RequestClientHeight(int height)
     {
-        height = (int)Math.Round(height * _uiScale);
         if (_requestedClientHeight == height || !IsHandleCreated) return;
         _requestedClientHeight = height;
         BeginInvoke(new Action(() =>
@@ -560,7 +636,7 @@ internal sealed class SettingsWindow : Form
         }
     }
 
-    private static string Format(double? value) => value is null || double.IsNaN(value.Value) ? "N/A" : value.Value.ToString("F2");
+    private static string Format(double? value) => LatencyFormatter.Milliseconds(value);
 
     private static uint GetHotkeyModifiers(KeyEventArgs e)
     {
