@@ -125,7 +125,9 @@ dotnet run --project Overlay -c Release -- --autostart
 
 ### Control Panel and Live Metrics
 
-![Latest YarrOverlay control panel](./imgs/control-panel-latest.png)
+![Latest YarrOverlay control panel1](./imgs/Overlay.png)
+![Latest YarrOverlay control panel2](./imgs/Per.png)
+![Latest YarrOverlay control panel2](./Set/Per.png)
 
 ### Overlay Output Examples
 
@@ -133,7 +135,4 @@ dotnet run --project Overlay -c Release -- --autostart
 
 ![YarrOverlay output close-up](./imgs/overlay-output-close.png)
 
-### Additional Screenshots
-
 ![YarrOverlay Overlay Output](./imgs/2.png)
-![YarrOverlay Overlay](./imgs/3.png)
