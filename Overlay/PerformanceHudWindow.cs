@@ -8,8 +8,8 @@ namespace Overlay;
 
 internal sealed class PerformanceHudWindow : Form
 {
-    private const double BasicDeadbandMs = 0.01;
-    private const double BasicRelativeDeadband = 0.005;
+    private const double BasicDeadbandMs = 1.0;
+    private const string WaitingText = "YarrOverlay | Waiting for starting...";
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 250 };
     private readonly Font _font = new("Consolas", 10.5f, FontStyle.Bold, GraphicsUnit.Point);
     private readonly Font _totalFont = new("Consolas", 14f, FontStyle.Bold, GraphicsUnit.Point);
@@ -21,7 +21,11 @@ internal sealed class PerformanceHudWindow : Form
     {
         FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true; StartPosition=FormStartPosition.Manual;
         BackColor=Color.FromArgb(13,16,22); ForeColor=Color.White; Opacity=.94; ClientSize=new Size(510,190);
-        _timer.Tick += (_,_) => Invalidate(); _timer.Start();
+        DoubleBuffered = true;
+        ResizeRedraw = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        _timer.Tick += (_,_) => { if (_running && _mode != PerformanceHudMode.Off) Invalidate(); };
+        _timer.Start();
     }
     protected override CreateParams CreateParams { get { var cp=base.CreateParams; cp.ExStyle|=NativeMethods.WsExTransparent|NativeMethods.WsExToolWindow|NativeMethods.WsExNoActivate; return cp; } }
     protected override bool ShowWithoutActivation => true;
@@ -33,17 +37,19 @@ internal sealed class PerformanceHudWindow : Form
         _running=running;
         if (!running)
         {
-            ClientSize = new Size(350, 44);
+            SetBasicHudSize(WaitingText);
             ApplyRoundedShape(12);
             ShowHud();
         }
         else if(mode==PerformanceHudMode.Off) Hide();
         else
         {
-            ClientSize=mode==PerformanceHudMode.Basic?new Size(248,44):new Size(510,190);
+            if (mode == PerformanceHudMode.Basic) SetBasicHudSize("YarrOverlay | 9999 ms");
+            else ClientSize=new Size(510,190);
             ApplyRoundedShape(mode == PerformanceHudMode.Basic ? 12 : 10);
             ShowHud();
         }
+        Invalidate();
     }
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -52,14 +58,14 @@ internal sealed class PerformanceHudWindow : Form
         e.Graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
         if (!_running)
         {
-            DrawBasicBox(e.Graphics, "YarrOverlay | Waiting for starting...");
+            DrawBasicBox(e.Graphics, WaitingText);
             return;
         }
 
         var p=LatencyMetrics.Global.Snapshot(); var w=p.TenSeconds; var y=10f;
         if(_mode==PerformanceHudMode.Basic)
         {
-            DrawBasicBox(e.Graphics, $"YarrOverlay | {F(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms");
+            DrawBasicBox(e.Graphics, $"YarrOverlay | {FBasic(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms");
             return;
         }
         void Line(string s){e.Graphics.DrawString(s,_font,Brushes.White,10,y);y+=20;}
@@ -70,14 +76,20 @@ internal sealed class PerformanceHudWindow : Form
     }
     protected override void Dispose(bool disposing){if(disposing){_timer.Dispose();_font.Dispose();_totalFont.Dispose();}base.Dispose(disposing);}
     private static string F(double v)=>double.IsNaN(v)?"N/A":v.ToString("F2");
+    private static string FBasic(double v)=>double.IsNaN(v)?"N/A":v.ToString("F0");
 
     private double PresentBasicLatency(double raw)
     {
         if (double.IsNaN(raw) || double.IsInfinity(raw)) return raw;
         if (double.IsNaN(_displayedBasicLatency)) _displayedBasicLatency = raw;
-        var deadband = Math.Max(BasicDeadbandMs, Math.Abs(_displayedBasicLatency) * BasicRelativeDeadband);
-        if (Math.Abs(raw - _displayedBasicLatency) > deadband) _displayedBasicLatency = raw;
+        if (Math.Abs(raw - _displayedBasicLatency) > BasicDeadbandMs) _displayedBasicLatency = raw;
         return _displayedBasicLatency;
+    }
+
+    private void SetBasicHudSize(string widestText)
+    {
+        var textSize = TextRenderer.MeasureText(widestText, _font);
+        ClientSize = new Size(Math.Max(248, textSize.Width + 42), Math.Max(44, textSize.Height + 22));
     }
 
     private void DrawBasicBox(Graphics graphics, string text)

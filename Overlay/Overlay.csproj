@@ -8,6 +8,17 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishSelfContained>true</PublishSelfContained>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugSymbols>false</DebugSymbols>
+    <DebugType>None</DebugType>
+    <PublishDir>$(MSBuildProjectDirectory)\bin\Release\single-file\</PublishDir>
+  </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Hexa.NET.ImGui.Backends" Version="1.0.18" />
     <PackageReference Include="TerraFX.Interop.Windows" Version="10.0.26100.6" />

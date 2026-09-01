@@ -21,6 +21,7 @@ internal sealed class SettingsWindow : Form
     private long _lastThresholdRepeat;
     private int _lastThresholdHotkeyId;
     private int _requestedClientHeight = 630;
+    private float _uiScale = 1f;
     private bool _disposed;
 
     public SettingsWindow(AppState state)
@@ -45,6 +46,7 @@ internal sealed class SettingsWindow : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        _uiScale = Math.Max(1f, DeviceDpi / 96f);
         _controller = new ImGuiD3D11Controller(Handle, ClientSize.Width, ClientSize.Height, DeviceDpi / 96f);
         _hotkeys = new HotkeyManager(Handle);
         _hotkeys.RegisterThresholdHotkeys();
@@ -235,14 +237,14 @@ internal sealed class SettingsWindow : Form
 
             if (ImGui.BeginTabItem("Performance"))
             {
-                RequestClientHeight(900);
+                RequestClientHeight(1000);
                 DrawPerformanceTab();
                 ImGui.EndTabItem();
             }
 
             if (ImGui.BeginTabItem("Settings"))
             {
-                RequestClientHeight(640);
+                RequestClientHeight(680);
                 DrawSettingsTab();
                 ImGui.EndTabItem();
             }
@@ -332,7 +334,7 @@ internal sealed class SettingsWindow : Form
         var recent = p?.TenSeconds ?? WindowPerformance.Empty;
 
         ImGui.Spacing();
-        BeginCard("LatencyCard", 130, "APP LATENCY");
+        BeginCard("LatencyCard", 150, "APP LATENCY");
         ImGui.PushFont(_controller!.MonoFont, 0);
         ImGui.TextColored(ImGuiTheme.AccentBright, $"{Format(p?.TotalAppLatencyEstimateMs),7} ms");
         ImGui.SameLine();
@@ -342,7 +344,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("TuningCard", 210, "PIPELINE");
+        BeginCard("TuningCard", 245, "PIPELINE");
         if (ImGui.BeginTable("TuningGrid", 2, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV))
         {
             ImGui.TableNextColumn();
@@ -371,7 +373,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("MetricsCard", 330, "METRICS");
+        BeginCard("MetricsCard", 390, "METRICS");
         if (ImGui.BeginTable("StageMetrics", 3, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.RowBg))
         {
             ImGui.TableSetupColumn("Stage");
@@ -421,7 +423,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("HotkeyCard", 155, "UI HOTKEY");
+        BeginCard("HotkeyCard", 190, "UI HOTKEY");
         ImGui.Text("UI Hotkey");
         ImGui.SameLine();
         var buttonText = _bindingHotkey ? "Press a key..." : $"[ {_state.UiHotkey.DisplayText} ]";
@@ -434,7 +436,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("ShortcutsCard", 150, "SHORTCUTS");
+        BeginCard("ShortcutsCard", 170, "SHORTCUTS");
         ImGui.PushFont(_controller!.MonoFont, 0);
         ImGui.Text("Space        Start / stop overlay");
         ImGui.Text("Global +/-   Adjust black threshold by one");
@@ -443,9 +445,13 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
     }
 
-    private static void BeginCard(string id, float height, string title)
+    private void BeginCard(string id, float height, string title)
     {
-        ImGui.BeginChild(id, new Vector2(0, height), ImGuiChildFlags.Borders);
+        ImGui.BeginChild(
+            id,
+            new Vector2(0, height * _uiScale),
+            ImGuiChildFlags.Borders,
+            ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
         ImGui.TextColored(ImGuiTheme.Accent, title);
         ImGui.Separator();
     }
@@ -498,6 +504,7 @@ internal sealed class SettingsWindow : Form
 
     private void RequestClientHeight(int height)
     {
+        height = (int)Math.Round(height * _uiScale);
         if (_requestedClientHeight == height || !IsHandleCreated) return;
         _requestedClientHeight = height;
         BeginInvoke(new Action(() =>
