@@ -15,8 +15,18 @@ internal static class NativeMethods
     public const byte AcSrcAlpha = 0x01;
     public const int HwndTopmost = -1;
     public const uint SwpNoActivate = 0x0010;
+    public const uint SwpNoSize = 0x0001;
+    public const uint SwpNoMove = 0x0002;
     public const uint SwpShowWindow = 0x0040;
     public const int WmHotkey = 0x0312;
+    public const int WmNcLButtonDown = 0x00A1;
+    public const int HtCaption = 0x0002;
+    public const int DwmwaWindowCornerPreference = 33;
+    public const int DwmWindowCornerPreferenceRound = 2;
+    public const uint ModAlt = 0x0001;
+    public const uint ModControl = 0x0002;
+    public const uint ModShift = 0x0004;
+    public const uint ModWin = 0x0008;
     public const uint ModNorepeat = 0x4000;
     public const int HotkeyIncrease = 0x5001;
     public const int HotkeyDecrease = 0x5002;
@@ -65,6 +75,18 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmSetWindowAttribute(IntPtr hWnd, int attribute, ref int value, int valueSize);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr GetDC(IntPtr hWnd);

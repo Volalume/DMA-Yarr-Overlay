@@ -1,129 +1,176 @@
 using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Text;
+using System.Numerics;
 using System.Windows.Forms;
+using Hexa.NET.ImGui;
 
 namespace Overlay;
 
 internal sealed class SettingsWindow : Form
 {
     private readonly AppState _state;
-    private readonly Dictionary<string, Rectangle> _buttons = new();
-    private readonly Font _heroFont = new("Segoe UI Semibold", 28f, FontStyle.Bold, GraphicsUnit.Pixel);
-    private readonly Font _titleFont = new("Segoe UI Semibold", 18f, FontStyle.Bold, GraphicsUnit.Pixel);
-    private readonly Font _bodyFont = new("Segoe UI", 15f, FontStyle.Regular, GraphicsUnit.Pixel);
-    private readonly Font _smallFont = new("Consolas", 12f, FontStyle.Regular, GraphicsUnit.Pixel);
-    private readonly StringFormat _ellipsisFormat = new()
-    {
-        Trimming = StringTrimming.EllipsisCharacter,
-        FormatFlags = StringFormatFlags.NoWrap
-    };
-    private readonly StringFormat _centerFormat = new()
-    {
-        Alignment = StringAlignment.Center,
-        LineAlignment = StringAlignment.Center
-    };
-    private string? _hoveredButton;
-    private readonly System.Windows.Forms.Timer _metricsTimer = new() { Interval = 250 };
-    private PerformanceDetailsWindow? _detailsWindow;
+    private readonly System.Windows.Forms.Timer _renderTimer;
+    private ImGuiD3D11Controller? _controller;
+    private HotkeyManager? _hotkeys;
+    private PerformanceSnapshot? _performance;
+    private long _nextPerformanceRefresh;
+    private bool _bindingHotkey;
+    private string? _notification;
+    private long _thresholdHoldStarted;
+    private long _lastThresholdRepeat;
+    private int _lastThresholdHotkeyId;
+    private int _requestedClientHeight = 630;
+    private bool _disposed;
 
     public SettingsWindow(AppState state)
     {
         _state = state;
-        _state.StateChanged += HandleStateChanged;
-
         Text = "YarrOverlay Control";
-        ClientSize = new Size(1500, 920);
-        MinimumSize = new Size(1500, 920);
-        FormBorderStyle = FormBorderStyle.FixedSingle;
+        ClientSize = new Size(1120, _requestedClientHeight);
+        StartPosition = FormStartPosition.CenterScreen;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = true;
         MaximizeBox = false;
-        MinimizeBox = true;
-        DoubleBuffered = true;
+        MinimizeBox = false;
         KeyPreview = true;
-        BackColor = Color.FromArgb(10, 12, 16);
-        ForeColor = Color.Gainsboro;
+        BackColor = Color.FromArgb(10, 12, 17);
+        TopMost = _state.AlwaysOnTop;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.Opaque | ControlStyles.UserPaint, true);
 
-        RegisterGlobalHotkeys();
-        _metricsTimer.Tick += (_, _) => Invalidate();
+        _renderTimer = new System.Windows.Forms.Timer { Interval = 16 };
+        _renderTimer.Tick += RenderFrame;
     }
 
-    protected override void OnLoad(EventArgs e)
+    protected override void OnHandleCreated(EventArgs e)
     {
-        base.OnLoad(e);
-        _metricsTimer.Start();
-        Invalidate();
+        base.OnHandleCreated(e);
+        _controller = new ImGuiD3D11Controller(Handle, ClientSize.Width, ClientSize.Height, DeviceDpi / 96f);
+        _hotkeys = new HotkeyManager(Handle);
+        _hotkeys.RegisterThresholdHotkeys();
+        if (!_hotkeys.TrySetUiHotkey(_state.UiHotkey)) _notification = _hotkeys.LastError;
+
+        var cornerPreference = NativeMethods.DwmWindowCornerPreferenceRound;
+        NativeMethods.DwmSetWindowAttribute(
+            Handle,
+            NativeMethods.DwmwaWindowCornerPreference,
+            ref cornerPreference,
+            sizeof(int));
+
+        if (Visible && WindowState != FormWindowState.Minimized) _renderTimer.Start();
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    protected override void OnShown(EventArgs e)
     {
-        base.OnPaint(e);
-
-        var g = e.Graphics;
-        g.Clear(BackColor);
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-
-        _buttons.Clear();
-
-        DrawBackdrop(g);
-        DrawHeader(g);
-        DrawLayout(g);
-    }
-
-    protected override void OnMouseMove(MouseEventArgs e)
-    {
-        base.OnMouseMove(e);
-        var previous = _hoveredButton;
-        _hoveredButton = null;
-
-        foreach (var (key, rect) in _buttons)
+        base.OnShown(e);
+        WindowState = FormWindowState.Normal;
+        TopMost = _state.AlwaysOnTop;
+        _renderTimer.Start();
+        BeginInvoke(new Action(() =>
         {
-            if (rect.Contains(e.Location))
-            {
-                _hoveredButton = key;
-                break;
-            }
+            if (IsDisposed) return;
+            Show();
+            BringToFront();
+            Activate();
+            NativeMethods.SetForegroundWindow(Handle);
+        }));
+    }
+
+    protected override void OnDeactivate(EventArgs e)
+    {
+        base.OnDeactivate(e);
+        if (!_state.AlwaysOnTop || !Visible || !IsHandleCreated) return;
+        NativeMethods.SetWindowPos(
+            Handle,
+            new IntPtr(NativeMethods.HwndTopmost),
+            0,
+            0,
+            0,
+            0,
+            NativeMethods.SwpNoMove | NativeMethods.SwpNoSize | NativeMethods.SwpNoActivate);
+    }
+
+    protected override void OnHandleDestroyed(EventArgs e)
+    {
+        _renderTimer.Stop();
+        _hotkeys?.Dispose();
+        _hotkeys = null;
+        _controller?.Dispose();
+        _controller = null;
+        base.OnHandleDestroyed(e);
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        if (_controller is null) return;
+        if (Visible && WindowState != FormWindowState.Minimized) _renderTimer.Start();
+        else _renderTimer.Stop();
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (WindowState == FormWindowState.Minimized)
+        {
+            _renderTimer.Stop();
+            return;
         }
 
-        if (previous != _hoveredButton)
-        {
-            Invalidate();
-        }
+        if (Visible) _renderTimer.Start();
+        _controller?.Resize(ClientSize.Width, ClientSize.Height);
+    }
+
+    protected override void OnPaint(PaintEventArgs e) => _controller?.Render(DrawUi);
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-
-        foreach (var (key, rect) in _buttons)
+        if (e.Button == MouseButtons.Left && e.Y < 52 && e.X < ClientSize.Width - 104)
         {
-            if (rect.Contains(e.Location))
-            {
-                ActivateButton(key);
-                return;
-            }
+            NativeMethods.ReleaseCapture();
+            NativeMethods.SendMessage(Handle, NativeMethods.WmNcLButtonDown, new IntPtr(NativeMethods.HtCaption), IntPtr.Zero);
         }
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
+        if (_bindingHotkey)
+        {
+            if (e.KeyCode == Keys.Escape)
+            {
+                _bindingHotkey = false;
+                _notification = "Hotkey binding cancelled.";
+                e.Handled = true;
+                return;
+            }
 
-        if (e.KeyCode == Keys.Oemplus || e.KeyCode == Keys.Add)
-        {
-            _state.IncreaseThreshold(1);
+            if (e.KeyCode is Keys.ControlKey or Keys.ShiftKey or Keys.Menu or Keys.LWin or Keys.RWin) return;
+            var binding = new HotkeyBinding(e.KeyCode, GetHotkeyModifiers(e));
+            if (_hotkeys?.TrySetUiHotkey(binding) == true)
+            {
+                _state.SetUiHotkey(binding);
+                _notification = $"UI hotkey changed to {binding.DisplayText}.";
+            }
+            else
+            {
+                _notification = _hotkeys?.LastError ?? "Could not register that hotkey.";
+            }
+
+            _bindingHotkey = false;
             e.Handled = true;
+            e.SuppressKeyPress = true;
+            return;
         }
-        else if (e.KeyCode == Keys.OemMinus || e.KeyCode == Keys.Subtract)
+
+        if (e.KeyCode == Keys.Space)
         {
-            _state.IncreaseThreshold(-1);
-            e.Handled = true;
-        }
-        else if (e.KeyCode == Keys.Space)
-        {
-            _state.ToggleRunning();
+            RunUiAction(_state.ToggleRunning);
             e.Handled = true;
         }
     }
@@ -132,389 +179,386 @@ internal sealed class SettingsWindow : Form
     {
         if (m.Msg == NativeMethods.WmHotkey)
         {
-            if (m.WParam.ToInt32() == NativeMethods.HotkeyIncrease)
-            {
-                _state.IncreaseThreshold(1);
-            }
-            else if (m.WParam.ToInt32() == NativeMethods.HotkeyDecrease)
-            {
-                _state.IncreaseThreshold(-1);
-            }
+            var id = m.WParam.ToInt32();
+            if (id == NativeMethods.HotkeyIncrease) _state.IncreaseThreshold(GetThresholdHotkeyStep(id));
+            else if (id == NativeMethods.HotkeyDecrease) _state.IncreaseThreshold(-GetThresholdHotkeyStep(id));
+            else if (_hotkeys?.IsUiHotkey(id) == true) ToggleSettingsVisibility();
         }
 
+        _controller?.ProcessWindowMessage(ref m);
         base.WndProc(ref m);
     }
 
-    protected override void OnFormClosed(FormClosedEventArgs e)
+    protected override void Dispose(bool disposing)
     {
-        _metricsTimer.Stop();
-        _metricsTimer.Dispose();
-        _detailsWindow?.Dispose();
-        UnregisterGlobalHotkeys();
-        _state.StateChanged -= HandleStateChanged;
-        base.OnFormClosed(e);
-    }
-
-    private void DrawBackdrop(Graphics g)
-    {
-        using var topGlow = new LinearGradientBrush(
-            new Rectangle(0, 0, ClientSize.Width, ClientSize.Height),
-            Color.FromArgb(20, 24, 34),
-            Color.FromArgb(8, 10, 14),
-            90f);
-        g.FillRectangle(topGlow, ClientRectangle);
-
-        using var accentBrush = new SolidBrush(Color.FromArgb(28, 255, 214, 102));
-        g.FillEllipse(accentBrush, new Rectangle(-80, -120, 420, 240));
-        g.FillEllipse(accentBrush, new Rectangle(ClientSize.Width - 260, 18, 220, 140));
-    }
-
-    private void DrawHeader(Graphics g)
-    {
-        using var accentBrush = new SolidBrush(Color.FromArgb(255, 255, 214, 102));
-        using var subBrush = new SolidBrush(Color.FromArgb(184, 190, 198));
-        using var chipBrush = new SolidBrush(_state.IsRunning ? Color.FromArgb(28, 46, 34) : Color.FromArgb(44, 25, 25));
-        using var chipTextBrush = new SolidBrush(_state.IsRunning ? Color.FromArgb(120, 255, 170) : Color.FromArgb(255, 140, 140));
-
-        g.DrawString("YarrOverlay", _heroFont, accentBrush, 42, 30);
-        g.DrawString("Monitor chroma overlay routing with click-through output", _bodyFont, subBrush, 44, 74);
-
-        var chip = new Rectangle(ClientSize.Width - 208, 34, 150, 38);
-        FillRoundedRect(g, chipBrush, chip, 18);
-        g.DrawString(_state.IsRunning ? "LIVE OUTPUT" : "STOPPED", _smallFont, chipTextBrush, chip.X + 21, chip.Y + 12);
-    }
-
-    private void DrawLayout(Graphics g)
-    {
-        var left = new Rectangle(40, 120, 760, 750);
-        var rightTop = new Rectangle(828, 120, 632, 410);
-        var rightBottom = new Rectangle(828, 556, 632, 314);
-
-        DrawRoutingCard(g, left);
-        DrawStatusCard(g, rightTop);
-        DrawPerformanceControls(g, rightBottom);
-    }
-
-    private void DrawRoutingCard(Graphics g, Rectangle card)
-    {
-        DrawCard(g, card, "Routing + Keying", "Capture/output assignment and black-key strength");
-
-        var x = card.X + 28;
-        var y = card.Y + 88;
-
-        DrawChooser(g, "Capture Display", _state.CurrentInputMonitor.Name, "inputPrev", "inputNext", x, y, card.Width - 56);
-        y += 108;
-        DrawChooser(g, "Output Display", _state.CurrentOutputMonitor.Name, "outputPrev", "outputNext", x, y, card.Width - 56);
-        y += 118;
-        DrawScaling(g, x, y, card.Width - 56);
-        y += 82;
-        DrawThreshold(g, x, y, card.Width - 56);
-        y += 128;
-        DrawSharpness(g, x, y, card.Width - 56);
-        y += 128;
-        DrawTransport(g, x, y, card.Width - 56);
-    }
-
-    private void DrawStatusCard(Graphics g, Rectangle card)
-    {
-        DrawCard(g, card, "Live Status", "Current route and transport health");
-        DrawButton(g,new Rectangle(card.Right-182,card.Y+22,158,40),"Full Metrics","metricsDetails",false);
-
-        using var mainBrush = new SolidBrush(Color.FromArgb(232, 236, 240));
-        using var dimBrush = new SolidBrush(Color.FromArgb(165, 172, 184));
-        using var okBrush = new SolidBrush(Color.FromArgb(120, 255, 170));
-        using var warnBrush = new SolidBrush(Color.FromArgb(255, 140, 140));
-        using var panelBrush = new SolidBrush(Color.FromArgb(18, 21, 27));
-
-        var inner = new Rectangle(card.X + 24, card.Y + 88, card.Width - 48, 100);
-        FillRoundedRect(g, panelBrush, inner, 18);
-
-        g.DrawString("Capture", _smallFont, dimBrush, inner.X + 18, inner.Y + 16);
-        g.DrawString($"{_state.CurrentInputMonitor.Name}", _bodyFont, mainBrush, new RectangleF(inner.X + 92, inner.Y + 14, inner.Width - 110, 24), _ellipsisFormat);
-        g.DrawString("Output", _smallFont, dimBrush, inner.X + 18, inner.Y + 52);
-        g.DrawString($"{_state.CurrentOutputMonitor.Name}", _bodyFont, mainBrush, new RectangleF(inner.X + 92, inner.Y + 50, inner.Width - 110, 24), _ellipsisFormat);
-
-        var perf = _state.Diagnostics.Performance ?? LatencyMetrics.Global.Snapshot();
-        var one = perf.OneSecond; var ten = perf.TenSeconds;
-        g.DrawString($"{_state.Diagnostics.PipelineMode}  | Capture {_state.CaptureFps} FPS | Submit {one.SubmitFps:F1} FPS", _smallFont, _state.IsRunning ? okBrush : warnBrush, card.X + 24, card.Y + 204);
-        var ago = _state.Diagnostics.LastFrameAt is null ? "no frame" : $"{(DateTimeOffset.Now - _state.Diagnostics.LastFrameAt.Value).TotalSeconds:F1}s ago";
-        g.DrawString($"Software submit ms: cur {F(ten.Pipeline.Current)} / avg {F(ten.Pipeline.Average)} / p95 {F(ten.Pipeline.P95)} / p99 {F(ten.Pipeline.P99)}", _smallFont, dimBrush, card.X + 24, card.Y + 230);
-        g.DrawString($"TOTAL APP LATENCY ESTIMATE: {F(perf.TotalAppLatencyEstimateMs)} ms", _titleFont, okBrush, card.X + 24, card.Y + 252);
-        g.DrawString($"Acquire {F(ten.AcquireWait.Average)} | Map {F(ten.MapWait.Average)} | CPU copy {F(ten.CpuCopy.Average)} | UI {F(ten.UiQueue.Average)} | Submit {F(ten.Submit.Average)} ms", _smallFont, dimBrush, card.X + 24, card.Y + 278);
-        g.DrawString($"Age {F(ten.FrameAge.Average)} | interval {F(ten.FrameInterval.Average)} | GPU copy/shader/total {F(ten.GpuCopy.Average)}/{F(ten.GpuShader.Average)}/{F(ten.GpuTotal.Average)} ms", _smallFont, dimBrush, card.X + 24, card.Y + 302);
-        g.DrawString($"Captured {perf.CapturedFrames} | Submitted {perf.SubmittedFrames} | Dropped {perf.DroppedFrames} | Replaced {perf.ReplacedFrames}", _smallFont, dimBrush, card.X + 24, card.Y + 326);
-        g.DrawString($"Accumulated Σ {perf.AccumulatedFrames}, max {perf.MaxAccumulatedFrames} | DXGI errors {perf.DxgiErrors} | recreates {_state.Diagnostics.RecreateCount}", _smallFont, dimBrush, card.X + 24, card.Y + 350);
-        g.DrawString($"Last {ago} | threads C/R {_state.Diagnostics.CaptureThreadId}/{_state.Diagnostics.RenderThreadId} | same GPU {_state.Diagnostics.SameAdapter} | CSV lost {_state.Diagnostics.CsvLostRows}", _smallFont, dimBrush, card.X + 24, card.Y + 374);
-        g.DrawString($"Recovery last/total {_state.Diagnostics.LastRecoveryMs:F1}/{_state.Diagnostics.TotalRecoveryMs:F1} ms | GC {_state.Diagnostics.Gen0}/{_state.Diagnostics.Gen1}/{_state.Diagnostics.Gen2} | WS {_state.Diagnostics.WorkingSetBytes/1048576.0:F1} MiB", _smallFont, dimBrush, card.X + 24, card.Y + 394);
-    }
-
-    private void DrawPerformanceControls(Graphics g, Rectangle card)
-    {
-        DrawCard(g, card, "Latency + Diagnostics", "Pipeline, instrumentation, scheduler and test options");
-        var x=card.X+24; var y=card.Y+90; var w=180; var gap=12;
-        DrawButton(g,new Rectangle(x,y,w,44),$"Pipeline: {_state.PipelineMode}","pipeline",false);
-        DrawButton(g,new Rectangle(x+w+gap,y,w,44),$"HUD: {_state.PerformanceHud}","hud",false);
-        DrawButton(g,new Rectangle(x+(w+gap)*2,y,w,44),$"Metrics: {_state.MetricsMode}","metrics",false);
-        y+=60;
-        DrawButton(g,new Rectangle(x,y,w,44),$"Priority: {_state.CapturePriority}","priority",false);
-        DrawButton(g,new Rectangle(x+w+gap,y,w,44),$"MMCSS: {(_state.MmcssEnabled?"On":"Off")}","mmcss",false);
-        DrawButton(g,new Rectangle(x+(w+gap)*2,y,w,44),$"CSV: {(_state.CsvEnabled?"On":"Off")}","csv",false);
-        y+=60;
-        DrawButton(g,new Rectangle(x,y,w,44),$"Latency Test: {(_state.LatencyTestMode?"On":"Off")}","latencyTest",false);
-        DrawButton(g,new Rectangle(x+w+gap,y,w,44),$"Max latency: {_state.MaximumFrameLatency}","maxLatency",false);
-        DrawButton(g,new Rectangle(x+(w+gap)*2,y,w,44),$"CSV every: {_state.CsvIntervalFrames}","csvInterval",false);
-        using var dim=new SolidBrush(Color.FromArgb(160,168,180));
-        g.DrawString($"Present: {_state.PresentMode}. Detailed GPU queries are collected eight frames later without blocking.",_smallFont,dim,new RectangleF(x,y+60,card.Width-48,44));
-    }
-
-    private void DrawCard(Graphics g, Rectangle rect, string title, string subtitle)
-    {
-        using var fillBrush = new SolidBrush(Color.FromArgb(26, 30, 38));
-        using var borderPen = new Pen(Color.FromArgb(66, 72, 84));
-        using var titleBrush = new SolidBrush(Color.FromArgb(245, 246, 248));
-        using var subtitleBrush = new SolidBrush(Color.FromArgb(152, 160, 170));
-
-        FillRoundedRect(g, fillBrush, rect, 26);
-        DrawRoundedRect(g, borderPen, rect, 26);
-        g.DrawString(title, _titleFont, titleBrush, rect.X + 24, rect.Y + 24);
-        g.DrawString(subtitle, _smallFont, subtitleBrush, rect.X + 24, rect.Y + 56);
-    }
-
-    private void DrawChooser(Graphics g, string label, string value, string leftButtonKey, string rightButtonKey, int x, int y, int width)
-    {
-        using var labelBrush = new SolidBrush(Color.FromArgb(210, 214, 220));
-        using var boxBrush = new SolidBrush(Color.FromArgb(16, 19, 24));
-        using var strokePen = new Pen(Color.FromArgb(74, 80, 94));
-        using var textBrush = new SolidBrush(Color.FromArgb(244, 245, 247));
-
-        g.DrawString(label, _bodyFont, labelBrush, x, y);
-
-        var rowY = y + 34;
-        var leftRect = new Rectangle(x, rowY, 52, 52);
-        var rightRect = new Rectangle(x + width - 52, rowY, 52, 52);
-        var valueRect = new Rectangle(x + 68, rowY, width - 136, 52);
-
-        DrawButton(g, leftRect, "<", leftButtonKey, true);
-        FillRoundedRect(g, boxBrush, valueRect, 16);
-        DrawRoundedRect(g, strokePen, valueRect, 16);
-        g.DrawString(value, _bodyFont, textBrush, new RectangleF(valueRect.X + 16, valueRect.Y + 15, valueRect.Width - 32, 24), _ellipsisFormat);
-        DrawButton(g, rightRect, ">", rightButtonKey, true);
-    }
-
-    private void DrawThreshold(Graphics g, int x, int y, int width)
-    {
-        using var labelBrush = new SolidBrush(Color.FromArgb(210, 214, 220));
-        using var dimBrush = new SolidBrush(Color.FromArgb(160, 168, 180));
-        using var trackBrush = new SolidBrush(Color.FromArgb(16, 19, 24));
-        using var fillBrush = new LinearGradientBrush(
-            new Rectangle(x, y, width, 52),
-            Color.FromArgb(255, 255, 214, 102),
-            Color.FromArgb(255, 255, 166, 76),
-            0f);
-        using var borderPen = new Pen(Color.FromArgb(74, 80, 94));
-
-        g.DrawString("Black Threshold", _bodyFont, labelBrush, x, y);
-
-        var rowY = y + 34;
-        var leftRect = new Rectangle(x, rowY, 52, 52);
-        var rightRect = new Rectangle(x + width - 52, rowY, 52, 52);
-        var trackRect = new Rectangle(x + 68, rowY + 15, width - 216, 22);
-        var pillRect = new Rectangle(trackRect.Right + 16, rowY, 80, 52);
-        var fillWidth = Math.Max(10, (int)(trackRect.Width * (_state.ChromaThreshold / 80f)));
-
-        DrawButton(g, leftRect, "-", "thresholdDown", true);
-        FillRoundedRect(g, trackBrush, new Rectangle(trackRect.X, trackRect.Y, trackRect.Width, trackRect.Height), 11);
-        FillRoundedRect(g, fillBrush, new Rectangle(trackRect.X, trackRect.Y, fillWidth, trackRect.Height), 11);
-        DrawRoundedRect(g, borderPen, new Rectangle(trackRect.X, trackRect.Y, trackRect.Width, trackRect.Height), 11);
-
-        FillRoundedRect(g, trackBrush, pillRect, 16);
-        DrawRoundedRect(g, borderPen, pillRect, 16);
-        g.DrawString($"{_state.ChromaThreshold}", _titleFont, Brushes.WhiteSmoke, new RectangleF(pillRect.X, pillRect.Y, pillRect.Width, pillRect.Height), _centerFormat);
-        DrawButton(g, rightRect, "+", "thresholdUp", true);
-
-        g.DrawString("0 keeps more shadow detail, 80 removes darker pixels more aggressively.", _smallFont, dimBrush, x, rowY + 66);
-    }
-
-    private static string F(double value) => double.IsNaN(value) ? "N/A" : value.ToString("F2");
-
-    private void DrawScaling(Graphics g, int x, int y, int width)
-    {
-        using var label = new SolidBrush(Color.FromArgb(210, 214, 220));
-        using var dim = new SolidBrush(Color.FromArgb(160, 168, 180));
-        g.DrawString("Scaling Mode", _bodyFont, label, x, y);
-        DrawButton(g, new Rectangle(x, y + 30, 220, 44), _state.ScalingMode.ToString(), "scaling", false);
-        g.DrawString("Stretch / Fit letterbox / Fill crop", _smallFont, dim, x + 240, y + 45);
-    }
-
-    private void DrawTransport(Graphics g, int x, int y, int width)
-    {
-        DrawButton(g, new Rectangle(x, y, 180, 54), _state.IsRunning ? "Stop Overlay" : "Start Overlay", "toggle", false);
-        DrawButton(g, new Rectangle(x + 198, y, 150, 54), "Refresh Displays", "refresh", false);
-
-        using var hintBrush = new SolidBrush(Color.FromArgb(160, 168, 180));
-        g.DrawString("Overlay stays on the selected output monitor and forwards clicks to the game window below.", _smallFont, hintBrush, new RectangleF(x, y + 70, width - 10, 40));
-    }
-
-    private void DrawSharpness(Graphics g, int x, int y, int width)
-    {
-        using var labelBrush = new SolidBrush(Color.FromArgb(210, 214, 220));
-        using var dimBrush = new SolidBrush(Color.FromArgb(160, 168, 180));
-        using var trackBrush = new SolidBrush(Color.FromArgb(16, 19, 24));
-        using var fillBrush = new LinearGradientBrush(
-            new Rectangle(x, y, width, 52),
-            Color.FromArgb(120, 196, 255),
-            Color.FromArgb(92, 150, 255),
-            0f);
-        using var borderPen = new Pen(Color.FromArgb(74, 80, 94));
-
-        g.DrawString("GPU Sharpness", _bodyFont, labelBrush, x, y);
-
-        var rowY = y + 34;
-        var leftRect = new Rectangle(x, rowY, 52, 52);
-        var rightRect = new Rectangle(x + width - 52, rowY, 52, 52);
-        var trackRect = new Rectangle(x + 68, rowY + 15, width - 216, 22);
-        var pillRect = new Rectangle(trackRect.Right + 16, rowY, 80, 52);
-        var fillWidth = Math.Max(10, (int)(trackRect.Width * (_state.Sharpness / 100f)));
-
-        DrawButton(g, leftRect, "-", "sharpnessDown", true);
-        FillRoundedRect(g, trackBrush, new Rectangle(trackRect.X, trackRect.Y, trackRect.Width, trackRect.Height), 11);
-        FillRoundedRect(g, fillBrush, new Rectangle(trackRect.X, trackRect.Y, fillWidth, trackRect.Height), 11);
-        DrawRoundedRect(g, borderPen, new Rectangle(trackRect.X, trackRect.Y, trackRect.Width, trackRect.Height), 11);
-
-        FillRoundedRect(g, trackBrush, pillRect, 16);
-        DrawRoundedRect(g, borderPen, pillRect, 16);
-        g.DrawString($"{_state.Sharpness}", _titleFont, Brushes.WhiteSmoke, new RectangleF(pillRect.X, pillRect.Y, pillRect.Width, pillRect.Height), _centerFormat);
-        DrawButton(g, rightRect, "+", "sharpnessUp", true);
-
-        g.DrawString("0 is pure linear scaling, 100 pushes the GPU sharpening pass hardest.", _smallFont, dimBrush, x, rowY + 66);
-    }
-
-    private void DrawButton(Graphics g, Rectangle rect, string text, string key, bool compact)
-    {
-        var hovered = key == _hoveredButton;
-        var baseColor = compact ? Color.FromArgb(255, 255, 214, 102) : Color.FromArgb(255, 255, 185, 88);
-        var hoverColor = compact ? Color.FromArgb(255, 255, 228, 138) : Color.FromArgb(255, 255, 204, 118);
-
-        using var fillBrush = new SolidBrush(hovered ? hoverColor : baseColor);
-        using var borderPen = new Pen(Color.FromArgb(35, 35, 35));
-        using var textBrush = new SolidBrush(Color.FromArgb(20, 20, 20));
-
-        FillRoundedRect(g, fillBrush, rect, 16);
-        DrawRoundedRect(g, borderPen, rect, 16);
-
-        var font = compact ? _titleFont : _bodyFont;
-        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-        g.DrawString(text, font, textBrush, new RectangleF(rect.X, rect.Y, rect.Width, rect.Height), _centerFormat);
-        _buttons[key] = rect;
-    }
-
-    private void ActivateButton(string key)
-    {
-        switch (key)
+        if (disposing && !_disposed)
         {
-            case "inputPrev":
-                _state.CycleInput(-1);
-                break;
-            case "inputNext":
-                _state.CycleInput(1);
-                break;
-            case "outputPrev":
-                _state.CycleOutput(-1);
-                break;
-            case "outputNext":
-                _state.CycleOutput(1);
-                break;
-            case "thresholdDown":
-                _state.IncreaseThreshold(-1);
-                break;
-            case "thresholdUp":
-                _state.IncreaseThreshold(1);
-                break;
-            case "toggle":
-                _state.ToggleRunning();
-                break;
-            case "refresh":
-                _state.RefreshMonitors();
-                break;
-            case "sharpnessDown":
-                _state.IncreaseSharpness(-2);
-                break;
-            case "sharpnessUp":
-                _state.IncreaseSharpness(2);
-                break;
-            case "scaling":
-                _state.CycleScalingMode();
-                break;
-            case "pipeline": _state.CyclePipelineMode(); break;
-            case "hud": _state.CycleHudMode(); break;
-            case "metrics": _state.CycleMetricsMode(); break;
-            case "priority": _state.CyclePriority(); break;
-            case "mmcss": _state.ToggleMmcss(); break;
-            case "csv": _state.ToggleCsv(); break;
-            case "maxLatency": _state.CycleMaximumFrameLatency(); break;
-            case "csvInterval": _state.CycleCsvInterval(); break;
-            case "metricsDetails":
-                if(_detailsWindow is null||_detailsWindow.IsDisposed)_detailsWindow=new PerformanceDetailsWindow(_state);
-                if(!_detailsWindow.Visible)_detailsWindow.Show(this);else _detailsWindow.BringToFront();
-                break;
-            case "latencyTest": _state.ToggleLatencyTest(); break;
+            _disposed = true;
+            _renderTimer.Stop();
+            _renderTimer.Tick -= RenderFrame;
+            _renderTimer.Dispose();
         }
+
+        base.Dispose(disposing);
     }
 
-    private void HandleStateChanged()
+    private void RenderFrame(object? sender, EventArgs e)
     {
-        if (IsDisposed)
+        if (Visible && WindowState != FormWindowState.Minimized) _controller?.Render(DrawUi);
+    }
+
+    private void DrawUi()
+    {
+        if (_controller is null) return;
+        ImGui.SetNextWindowPos(Vector2.Zero, ImGuiCond.Always);
+        ImGui.SetNextWindowSize(new Vector2(ClientSize.Width, ClientSize.Height), ImGuiCond.Always);
+        var flags = ImGuiWindowFlags.NoTitleBar
+            | ImGuiWindowFlags.NoResize
+            | ImGuiWindowFlags.NoMove
+            | ImGuiWindowFlags.NoCollapse
+            | ImGuiWindowFlags.NoScrollbar
+            | ImGuiWindowFlags.NoScrollWithMouse
+            | ImGuiWindowFlags.NoSavedSettings;
+
+        ImGui.PushFont(_controller.BodyFont, 0);
+        ImGui.Begin("YarrOverlay##Root", flags);
+        DrawHeader();
+
+        if (ImGui.BeginTabBar("MainTabs", ImGuiTabBarFlags.FittingPolicyShrink | ImGuiTabBarFlags.DrawSelectedOverline))
         {
+            if (ImGui.BeginTabItem("Overlay"))
+            {
+                RequestClientHeight(700);
+                DrawOverlayTab();
+                ImGui.EndTabItem();
+            }
+
+            if (ImGui.BeginTabItem("Performance"))
+            {
+                RequestClientHeight(900);
+                DrawPerformanceTab();
+                ImGui.EndTabItem();
+            }
+
+            if (ImGui.BeginTabItem("Settings"))
+            {
+                RequestClientHeight(640);
+                DrawSettingsTab();
+                ImGui.EndTabItem();
+            }
+
+            ImGui.EndTabBar();
+        }
+
+        DrawFooter();
+        ImGui.End();
+        ImGui.PopFont();
+    }
+
+    private void DrawHeader()
+    {
+        var headerY = ImGui.GetCursorPosY();
+        ImGui.TextColored(ImGuiTheme.Accent, "YARROVERLAY");
+        var status = _state.IsRunning ? "RUNNING" : "STOPPED";
+        var statusColor = _state.IsRunning ? ImGuiTheme.Good : ImGuiTheme.Warning;
+        ImGui.SameLine(ImGui.GetWindowWidth() - 176);
+        ImGui.TextColored(statusColor, status);
+
+        ImGui.SetCursorPos(new Vector2(ImGui.GetWindowWidth() - 94, headerY - 4));
+        var canHide = _hotkeys?.HasUiHotkey == true;
+        ImGui.BeginDisabled(!canHide);
+        if (ImGui.Button("_##HideWindow", new Vector2(32, 28))) BeginInvoke(new Action(Hide));
+        ImGui.EndDisabled();
+
+        ImGui.SameLine();
+        if (ImGui.Button("X##CloseWindow", new Vector2(32, 28))) BeginInvoke(new Action(Close));
+        ImGui.SetCursorPosY(headerY + 32);
+        ImGui.Separator();
+    }
+
+    private void DrawOverlayTab()
+    {
+        ImGui.Spacing();
+        BeginCard("RoutingCard", 170, "DISPLAY");
+        ImGui.SetNextItemWidth(-190);
+        if (ImGui.BeginCombo("Capture Display", _state.CurrentInputMonitor.Name))
+        {
+            for (var i = 0; i < _state.Monitors.Count; i++)
+            {
+                var selected = i == _state.SelectedInputIndex;
+                if (ImGui.Selectable(_state.Monitors[i].Name, selected)) RunUiAction(() => _state.SetInputIndex(i));
+                if (selected) ImGui.SetItemDefaultFocus();
+            }
+            ImGui.EndCombo();
+        }
+
+        ImGui.SetNextItemWidth(-190);
+        if (ImGui.BeginCombo("Output Display", _state.CurrentOutputMonitor.Name))
+        {
+            for (var i = 0; i < _state.Monitors.Count; i++)
+            {
+                var selected = i == _state.SelectedOutputIndex;
+                if (ImGui.Selectable(_state.Monitors[i].Name, selected)) RunUiAction(() => _state.SetOutputIndex(i));
+                if (selected) ImGui.SetItemDefaultFocus();
+            }
+            ImGui.EndCombo();
+        }
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        BeginCard("ImageCard", 250, "IMAGE PROCESSING");
+        var scaling = (int)_state.ScalingMode;
+        ImGui.SetNextItemWidth(-190);
+        if (ImGui.Combo("Scaling", ref scaling, "Stretch\0Fit\0Fill\0")) RunUiAction(() => _state.SetScalingMode((ScalingMode)scaling));
+
+        var threshold = _state.ChromaThreshold;
+        ImGui.SetNextItemWidth(-190);
+        if (ImGui.SliderInt("Black Threshold", ref threshold, 0, 80, "%d")) _state.SetThreshold(threshold);
+        var sharpness = _state.Sharpness;
+        ImGui.SetNextItemWidth(-190);
+        if (ImGui.SliderInt("Sharpness", ref sharpness, 0, 100, "%d%%")) _state.SetSharpness(sharpness);
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        if (ImGui.Button(_state.IsRunning ? "Stop Overlay" : "Start Overlay", new Vector2(168, 42))) RunUiAction(_state.ToggleRunning);
+        ImGui.SameLine();
+        if (ImGui.Button("Refresh Displays", new Vector2(168, 42)))
+        {
+            RunUiAction(_state.RefreshMonitors);
+            _notification ??= "Display topology refreshed.";
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled(_state.StatusText);
+    }
+
+    private void DrawPerformanceTab()
+    {
+        RefreshPerformanceSnapshot();
+        var p = _performance;
+        var recent = p?.TenSeconds ?? WindowPerformance.Empty;
+
+        ImGui.Spacing();
+        BeginCard("LatencyCard", 130, "APP LATENCY");
+        ImGui.PushFont(_controller!.MonoFont, 0);
+        ImGui.TextColored(ImGuiTheme.AccentBright, $"{Format(p?.TotalAppLatencyEstimateMs),7} ms");
+        ImGui.SameLine();
+        ImGui.Text($"AVG {Format(recent.Pipeline.Average)}   P95 {Format(recent.Pipeline.P95)}   P99 {Format(recent.Pipeline.P99)}");
+        ImGui.PopFont();
+        ImGui.TextDisabled($"Submit {recent.SubmitFps:F1} FPS  |  desktop->submit {Format(recent.DesktopToSubmit.Current)} ms current");
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        BeginCard("TuningCard", 210, "PIPELINE");
+        if (ImGui.BeginTable("TuningGrid", 2, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV))
+        {
+            ImGui.TableNextColumn();
+            var pipeline = (int)_state.PipelineMode;
+            ImGui.SetNextItemWidth(-145);
+            if (ImGui.Combo("Pipeline", ref pipeline, "Auto\0GPU Native\0Legacy CPU\0")) RunUiAction(() => _state.SetPipelineMode((PipelineMode)pipeline));
+
+            var maxLatency = _state.MaximumFrameLatency;
+            ImGui.SetNextItemWidth(-145);
+            if (ImGui.SliderInt("Maximum Frame Latency", ref maxLatency, 1, 3, "%d")) RunUiAction(() => _state.SetMaximumFrameLatency(maxLatency));
+            ImGui.TextDisabled("Present mode: Immediate");
+
+            ImGui.TableNextColumn();
+            var priority = (int)_state.CapturePriority;
+            ImGui.SetNextItemWidth(-145);
+            if (ImGui.Combo("Capture Priority", ref priority, "Normal\0Above Normal\0Highest\0")) RunUiAction(() => _state.SetCapturePriority((CapturePriority)priority));
+
+            var mmcss = _state.MmcssEnabled;
+            if (ImGui.Checkbox("MMCSS Games profile", ref mmcss)) RunUiAction(() => _state.SetMmcssEnabled(mmcss));
+
+            var metrics = (int)_state.MetricsMode;
+            ImGui.SetNextItemWidth(-145);
+            if (ImGui.Combo("Metrics", ref metrics, "Off\0Lightweight\0Detailed GPU\0")) RunUiAction(() => _state.SetMetricsMode((MetricsMode)metrics));
+            ImGui.EndTable();
+        }
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        BeginCard("MetricsCard", 330, "METRICS");
+        if (ImGui.BeginTable("StageMetrics", 3, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.RowBg))
+        {
+            ImGui.TableSetupColumn("Stage");
+            ImGui.TableSetupColumn("Current");
+            ImGui.TableSetupColumn("10 s average");
+            ImGui.TableHeadersRow();
+            DrawMetricRow("App pipeline", recent.Pipeline);
+            DrawMetricRow("Desktop -> submit", recent.DesktopToSubmit);
+            DrawMetricRow("Frame age", recent.FrameAge);
+            DrawMetricRow("Acquire wait", recent.AcquireWait);
+            DrawMetricRow("CPU copy", recent.CpuCopy);
+            DrawMetricRow("UI queue", recent.UiQueue);
+            DrawMetricRow("GPU copy", recent.GpuCopy);
+            DrawMetricRow("GPU shader / total", recent.GpuShader, recent.GpuTotal);
+            ImGui.EndTable();
+        }
+        ImGui.TextDisabled($"Queue {p?.QueueLength ?? 0}/{p?.MaxQueueLength ?? 0}  |  dropped {p?.DroppedFrames ?? 0}  |  replaced {p?.ReplacedFrames ?? 0}  |  DXGI errors {p?.DxgiErrors ?? 0}");
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        var hud = (int)_state.PerformanceHud;
+        ImGui.SetNextItemWidth(170);
+        if (ImGui.Combo("Latency HUD", ref hud, "Off\0Basic\0Detailed\0")) RunUiAction(() => _state.SetHudMode((PerformanceHudMode)hud));
+        ImGui.SameLine();
+        var csv = _state.CsvEnabled;
+        if (ImGui.Checkbox("CSV", ref csv)) RunUiAction(() => _state.SetCsvEnabled(csv));
+        ImGui.SameLine();
+        var csvInterval = _state.CsvIntervalFrames;
+        ImGui.SetNextItemWidth(130);
+        if (ImGui.SliderInt("CSV interval", ref csvInterval, 1, 240, "%d frames")) RunUiAction(() => _state.SetCsvIntervalFrames(csvInterval));
+        ImGui.SameLine();
+        var latencyTest = _state.LatencyTestMode;
+        if (ImGui.Checkbox("Latency test", ref latencyTest)) RunUiAction(() => _state.SetLatencyTestMode(latencyTest));
+    }
+
+    private void DrawSettingsTab()
+    {
+        ImGui.Spacing();
+        BeginCard("WindowCard", 120, "WINDOW");
+        var topMost = _state.AlwaysOnTop;
+        if (ImGui.Checkbox("Always On Top", ref topMost))
+        {
+            _state.SetAlwaysOnTop(topMost);
+            TopMost = topMost;
+            _notification = topMost ? "Control UI pinned above other apps." : "Control UI uses normal z-order.";
+        }
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        BeginCard("HotkeyCard", 155, "UI HOTKEY");
+        ImGui.Text("UI Hotkey");
+        ImGui.SameLine();
+        var buttonText = _bindingHotkey ? "Press a key..." : $"[ {_state.UiHotkey.DisplayText} ]";
+        if (ImGui.Button(buttonText, new Vector2(220, 38)))
+        {
+            _bindingHotkey = true;
+            _notification = "Press a key combination; Escape cancels.";
+        }
+        if (!string.IsNullOrWhiteSpace(_hotkeys?.LastError)) ImGui.TextColored(ImGuiTheme.Warning, _hotkeys.LastError);
+        ImGui.EndChild();
+
+        ImGui.Spacing();
+        BeginCard("ShortcutsCard", 150, "SHORTCUTS");
+        ImGui.PushFont(_controller!.MonoFont, 0);
+        ImGui.Text("Space        Start / stop overlay");
+        ImGui.Text("Global +/-   Adjust black threshold by one");
+        ImGui.Text($"{_state.UiHotkey.DisplayText,-12} Hide / show this control surface");
+        ImGui.PopFont();
+        ImGui.EndChild();
+    }
+
+    private static void BeginCard(string id, float height, string title)
+    {
+        ImGui.BeginChild(id, new Vector2(0, height), ImGuiChildFlags.Borders);
+        ImGui.TextColored(ImGuiTheme.Accent, title);
+        ImGui.Separator();
+    }
+
+    private void DrawMetricRow(string label, TimingStats stats, TimingStats? secondary = null)
+    {
+        ImGui.TableNextRow();
+        ImGui.TableNextColumn();
+        ImGui.Text(label);
+        ImGui.TableNextColumn();
+        ImGui.PushFont(_controller!.MonoFont, 0);
+        ImGui.Text(secondary is null ? $"{Format(stats.Current)} ms" : $"{Format(stats.Current)} / {Format(secondary.Current)} ms");
+        ImGui.PopFont();
+        ImGui.TableNextColumn();
+        ImGui.PushFont(_controller.MonoFont, 0);
+        ImGui.Text(secondary is null ? $"{Format(stats.Average)} ms" : $"{Format(stats.Average)} / {Format(secondary.Average)} ms");
+        ImGui.PopFont();
+    }
+
+    private void DrawFooter()
+    {
+        var height = ImGui.GetFrameHeightWithSpacing() + 2;
+        ImGui.SetCursorPosY(Math.Max(ImGui.GetCursorPosY(), ImGui.GetWindowHeight() - height - 10));
+        ImGui.Separator();
+        if (!string.IsNullOrWhiteSpace(_notification)) ImGui.TextDisabled(_notification);
+    }
+
+    private void RefreshPerformanceSnapshot()
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (now < _nextPerformanceRefresh) return;
+        _performance = LatencyMetrics.Global.Snapshot();
+        _nextPerformanceRefresh = now + Stopwatch.Frequency / 4;
+    }
+
+    private void ToggleSettingsVisibility()
+    {
+        if (Visible)
+        {
+            Hide();
             return;
         }
 
-        if (InvokeRequired)
+        Show();
+        WindowState = FormWindowState.Normal;
+        BringToFront();
+        Activate();
+        NativeMethods.SetForegroundWindow(Handle);
+    }
+
+    private void RequestClientHeight(int height)
+    {
+        if (_requestedClientHeight == height || !IsHandleCreated) return;
+        _requestedClientHeight = height;
+        BeginInvoke(new Action(() =>
         {
-            BeginInvoke(new Action(Invalidate));
-            return;
+            if (IsDisposed || ClientSize.Height == height) return;
+            var center = new Point(Left + Width / 2, Top + Height / 2);
+            ClientSize = new Size(ClientSize.Width, height);
+            var workingArea = Screen.FromHandle(Handle).WorkingArea;
+            Left = Math.Clamp(center.X - Width / 2, workingArea.Left, Math.Max(workingArea.Left, workingArea.Right - Width));
+            Top = Math.Clamp(center.Y - Height / 2, workingArea.Top, Math.Max(workingArea.Top, workingArea.Bottom - Height));
+        }));
+    }
+
+    private int GetThresholdHotkeyStep(int hotkeyId)
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (_lastThresholdHotkeyId != hotkeyId || _lastThresholdRepeat == 0 ||
+            now - _lastThresholdRepeat > Stopwatch.Frequency / 5)
+        {
+            _thresholdHoldStarted = now;
         }
 
-        Invalidate();
-    }
-
-    private void RegisterGlobalHotkeys()
-    {
-        NativeMethods.RegisterHotKey(Handle, NativeMethods.HotkeyIncrease, NativeMethods.ModNorepeat, NativeMethods.VkOemplus);
-        NativeMethods.RegisterHotKey(Handle, NativeMethods.HotkeyDecrease, NativeMethods.ModNorepeat, NativeMethods.VkOemMinus);
-    }
-
-    private void UnregisterGlobalHotkeys()
-    {
-        if (!IsHandleCreated)
+        _lastThresholdHotkeyId = hotkeyId;
+        _lastThresholdRepeat = now;
+        var heldMs = (now - _thresholdHoldStarted) * 1000.0 / Stopwatch.Frequency;
+        return heldMs switch
         {
-            return;
+            < 600 => 1,
+            < 1200 => 2,
+            < 2000 => 4,
+            _ => 8
+        };
+    }
+
+    private void RunUiAction(Action action)
+    {
+        try
+        {
+            action();
+            _notification = null;
         }
-
-        NativeMethods.UnregisterHotKey(Handle, NativeMethods.HotkeyIncrease);
-        NativeMethods.UnregisterHotKey(Handle, NativeMethods.HotkeyDecrease);
+        catch (Exception ex)
+        {
+            _notification = ex.Message;
+        }
     }
 
-    private static void FillRoundedRect(Graphics g, Brush brush, Rectangle rect, int radius)
-    {
-        using var path = CreateRoundedRectPath(rect, radius);
-        g.FillPath(brush, path);
-    }
+    private static string Format(double? value) => value is null || double.IsNaN(value.Value) ? "N/A" : value.Value.ToString("F2");
 
-    private static void DrawRoundedRect(Graphics g, Pen pen, Rectangle rect, int radius)
+    private static uint GetHotkeyModifiers(KeyEventArgs e)
     {
-        using var path = CreateRoundedRectPath(rect, radius);
-        g.DrawPath(pen, path);
-    }
-
-    private static GraphicsPath CreateRoundedRectPath(Rectangle rect, int radius)
-    {
-        var diameter = radius * 2;
-        var path = new GraphicsPath();
-        path.AddArc(rect.X, rect.Y, diameter, diameter, 180, 90);
-        path.AddArc(rect.Right - diameter, rect.Y, diameter, diameter, 270, 90);
-        path.AddArc(rect.Right - diameter, rect.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(rect.X, rect.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
+        var modifiers = 0u;
+        if (e.Control) modifiers |= NativeMethods.ModControl;
+        if (e.Shift) modifiers |= NativeMethods.ModShift;
+        if (e.Alt) modifiers |= NativeMethods.ModAlt;
+        return modifiers;
     }
 }

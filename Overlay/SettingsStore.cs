@@ -2,6 +2,8 @@ using System;
 using System.Drawing;
 using System.IO;
 using System.Text.Json;
+using System.Threading;
+using System.Windows.Forms;
 
 namespace Overlay;
 
@@ -35,10 +37,17 @@ internal sealed class AppSettings
     public bool CsvEnabled { get; set; }
     public int CsvIntervalFrames { get; set; } = 1;
     public bool LatencyTestMode { get; set; }
+    public bool AlwaysOnTop { get; set; } = true;
+    public int UiHotkeyKey { get; set; } = (int)Keys.F8;
+    public uint UiHotkeyModifiers { get; set; }
 }
 internal static class SettingsStore
 {
     private static readonly string Path = System.IO.Path.Combine(AppContext.BaseDirectory, "YarrOverlay.settings.json");
+    private static readonly object SaveSync = new();
+    private static readonly System.Threading.Timer SaveTimer = new(_ => Flush(), null, Timeout.Infinite, Timeout.Infinite);
+    private static string? _pendingJson;
+
     public static AppSettings Load()
     {
         if (!File.Exists(Path)) return new AppSettings();
@@ -47,7 +56,25 @@ internal static class SettingsStore
     }
     public static void Save(AppSettings settings)
     {
-        try { File.WriteAllText(Path, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true })); }
+        var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+        lock (SaveSync)
+        {
+            _pendingJson = json;
+            SaveTimer.Change(350, Timeout.Infinite);
+        }
+    }
+
+    public static void Flush()
+    {
+        string? json;
+        lock (SaveSync)
+        {
+            json = _pendingJson;
+            _pendingJson = null;
+        }
+
+        if (json is null) return;
+        try { File.WriteAllText(Path, json); }
         catch (Exception ex) { Logger.Error($"Settings save failed: {ex.Message}"); }
     }
 }
