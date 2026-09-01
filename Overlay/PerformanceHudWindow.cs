@@ -15,6 +15,7 @@ internal sealed class PerformanceHudWindow : Form
     private readonly Font _totalFont = new("Consolas", 14f, FontStyle.Bold, GraphicsUnit.Point);
     private MonitorInfo? _monitor;
     private PerformanceHudMode _mode;
+    private bool _running;
     private double _displayedBasicLatency = double.NaN;
     public PerformanceHudWindow()
     {
@@ -29,29 +30,36 @@ internal sealed class PerformanceHudWindow : Form
     {
         if (_mode != mode || !running) _displayedBasicLatency = double.NaN;
         _mode=mode;
-        if(mode==PerformanceHudMode.Off||!running) Hide();
+        _running=running;
+        if (!running)
+        {
+            ClientSize = new Size(350, 44);
+            ApplyRoundedShape(12);
+            ShowHud();
+        }
+        else if(mode==PerformanceHudMode.Off) Hide();
         else
         {
             ClientSize=mode==PerformanceHudMode.Basic?new Size(248,44):new Size(510,190);
             ApplyRoundedShape(mode == PerformanceHudMode.Basic ? 12 : 10);
-            Show();
-            NativeMethods.SetWindowPos(Handle,new IntPtr(NativeMethods.HwndTopmost),Left,Top,Width,Height,NativeMethods.SwpNoActivate|NativeMethods.SwpShowWindow);
+            ShowHud();
         }
     }
     protected override void OnPaint(PaintEventArgs e)
     {
-        base.OnPaint(e); var p=LatencyMetrics.Global.Snapshot(); var w=p.TenSeconds; var y=10f;
+        base.OnPaint(e);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         e.Graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+        if (!_running)
+        {
+            DrawBasicBox(e.Graphics, "YarrOverlay | Waiting for starting...");
+            return;
+        }
+
+        var p=LatencyMetrics.Global.Snapshot(); var w=p.TenSeconds; var y=10f;
         if(_mode==PerformanceHudMode.Basic)
         {
-            using var background = new SolidBrush(Color.FromArgb(20, 24, 32));
-            using var border = new Pen(Color.FromArgb(72, 79, 92));
-            using var accent = new SolidBrush(Color.FromArgb(255, 205, 72));
-            e.Graphics.FillRectangle(background, ClientRectangle);
-            e.Graphics.FillRectangle(accent, 0, 0, 4, ClientSize.Height);
-            e.Graphics.DrawRectangle(border, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
-            e.Graphics.DrawString($"YarrOverlay | {F(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms",_font,Brushes.White,14,12);
+            DrawBasicBox(e.Graphics, $"YarrOverlay | {F(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms");
             return;
         }
         void Line(string s){e.Graphics.DrawString(s,_font,Brushes.White,10,y);y+=20;}
@@ -70,6 +78,23 @@ internal sealed class PerformanceHudWindow : Form
         var deadband = Math.Max(BasicDeadbandMs, Math.Abs(_displayedBasicLatency) * BasicRelativeDeadband);
         if (Math.Abs(raw - _displayedBasicLatency) > deadband) _displayedBasicLatency = raw;
         return _displayedBasicLatency;
+    }
+
+    private void DrawBasicBox(Graphics graphics, string text)
+    {
+        using var background = new SolidBrush(Color.FromArgb(20, 24, 32));
+        using var border = new Pen(Color.FromArgb(72, 79, 92));
+        using var accent = new SolidBrush(Color.FromArgb(255, 205, 72));
+        graphics.FillRectangle(background, ClientRectangle);
+        graphics.FillRectangle(accent, 0, 0, 4, ClientSize.Height);
+        graphics.DrawRectangle(border, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+        graphics.DrawString(text, _font, Brushes.White, 14, 12);
+    }
+
+    private void ShowHud()
+    {
+        Show();
+        NativeMethods.SetWindowPos(Handle,new IntPtr(NativeMethods.HwndTopmost),Left,Top,Width,Height,NativeMethods.SwpNoActivate|NativeMethods.SwpShowWindow);
     }
 
     private void ApplyRoundedShape(int radius)

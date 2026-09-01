@@ -131,7 +131,7 @@ internal sealed record WindowPerformance(double CaptureFps, double SubmitFps, Ti
 internal sealed record PerformanceSnapshot(long CapturedFrames, long SubmittedFrames, long ReplacedFrames, long DroppedFrames, long AcquireTimeouts, long DxgiErrors, long AccumulatedFrames, long MaxAccumulatedFrames, int QueueLength, long MaxQueueLength, WindowPerformance OneSecond, WindowPerformance TenSeconds, WindowPerformance Session)
 {
     public TimingStats Pipeline => TenSeconds.Pipeline; public TimingStats MapWait => TenSeconds.MapWait; public TimingStats CpuCopy => TenSeconds.CpuCopy; public TimingStats UiQueue => TenSeconds.UiQueue;
-    // Basic HUD keeps the historic app-processing meaning. DesktopToSubmit remains
-    // available in the detailed views because it also includes source-frame age.
-    public double TotalAppLatencyEstimateMs => OneSecond.Pipeline.Current;
+    // Closest non-blocking app-side latency estimate: source desktop present to
+    // overlay submission. Physical output scan-out is intentionally not included.
+    public double TotalAppLatencyEstimateMs => OneSecond.DesktopToSubmit.Current;
 }

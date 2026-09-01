@@ -261,16 +261,10 @@ internal sealed class SettingsWindow : Form
         ImGui.TextColored(ImGuiTheme.Accent, "YARROVERLAY");
         var status = _state.IsRunning ? "RUNNING" : "STOPPED";
         var statusColor = _state.IsRunning ? ImGuiTheme.Good : ImGuiTheme.Warning;
-        ImGui.SameLine(ImGui.GetWindowWidth() - 176);
+        ImGui.SameLine(ImGui.GetWindowWidth() - 138);
         ImGui.TextColored(statusColor, status);
 
-        ImGui.SetCursorPos(new Vector2(ImGui.GetWindowWidth() - 94, headerY - 4));
-        var canHide = _hotkeys?.HasUiHotkey == true;
-        ImGui.BeginDisabled(!canHide);
-        if (ImGui.Button("_##HideWindow", new Vector2(32, 28))) BeginInvoke(new Action(Hide));
-        ImGui.EndDisabled();
-
-        ImGui.SameLine();
+        ImGui.SetCursorPos(new Vector2(ImGui.GetWindowWidth() - 54, headerY - 4));
         if (ImGui.Button("X##CloseWindow", new Vector2(32, 28))) BeginInvoke(new Action(Close));
         ImGui.SetCursorPosY(headerY + 32);
         ImGui.Separator();
@@ -342,9 +336,9 @@ internal sealed class SettingsWindow : Form
         ImGui.PushFont(_controller!.MonoFont, 0);
         ImGui.TextColored(ImGuiTheme.AccentBright, $"{Format(p?.TotalAppLatencyEstimateMs),7} ms");
         ImGui.SameLine();
-        ImGui.Text($"AVG {Format(recent.Pipeline.Average)}   P95 {Format(recent.Pipeline.P95)}   P99 {Format(recent.Pipeline.P99)}");
+        ImGui.Text($"AVG {Format(recent.DesktopToSubmit.Average)}   P95 {Format(recent.DesktopToSubmit.P95)}   P99 {Format(recent.DesktopToSubmit.P99)}");
         ImGui.PopFont();
-        ImGui.TextDisabled($"Submit {recent.SubmitFps:F1} FPS  |  desktop->submit {Format(recent.DesktopToSubmit.Current)} ms current");
+        ImGui.TextDisabled($"Submit {recent.SubmitFps:F1} FPS  |  CPU submit {Format(recent.Pipeline.Current)} ms");
         ImGui.EndChild();
 
         ImGui.Spacing();

@@ -31,6 +31,7 @@ internal sealed class AppState : IDisposable
         _capture.DiagnosticsChanged += diagnostics => { Diagnostics = diagnostics; StateChanged?.Invoke(); };
         _capture.RecreateRequested += HandleCaptureRecreate;
         UpdateOutputMonitor();
+        _overlayHost.SetHudMode(_settings.PerformanceHud, false);
         Save();
     }
 

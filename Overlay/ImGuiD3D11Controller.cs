@@ -33,6 +33,7 @@ internal sealed unsafe class ImGuiD3D11Controller : IDisposable
         ImGui.SetCurrentContext(_imGuiContext);
         var io = ImGui.GetIO();
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
+        io.IniFilename = null;
 
         BodyFont = LoadFont(io.Fonts, "segoeui.ttf", 16f * dpiScale);
         MonoFont = LoadFont(io.Fonts, "consola.ttf", 15f * dpiScale);
