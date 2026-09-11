@@ -13,6 +13,9 @@ internal enum PerformanceHudMode { Off, Basic, Detailed }
 internal enum MetricsMode { Off, Lightweight, DetailedGpu }
 internal enum CapturePriority { Normal, AboveNormal, Highest }
 internal enum PresentMode { Immediate }
+internal enum AntiCaptureMode { Off, Black, Exclude }
+internal enum GpuProtectionMode { Off, HardwareRequired }
+internal enum CaptureProtectionLevel { Off, Software, Hardware, Kernel }
 internal sealed record DisplaySelection(string DeviceName, string AdapterLuid, uint OutputIndex, int Width, int Height, int X, int Y)
 {
     public static DisplaySelection From(MonitorInfo m) => new(m.DeviceName, m.AdapterLuid, m.OutputIndex, m.Bounds.Width, m.Bounds.Height, m.Bounds.X, m.Bounds.Y);
@@ -38,6 +41,8 @@ internal sealed class AppSettings
     public int CsvIntervalFrames { get; set; } = 1;
     public bool LatencyTestMode { get; set; }
     public bool AlwaysOnTop { get; set; } = true;
+    public AntiCaptureMode AntiCapture { get; set; } = AntiCaptureMode.Off;
+    public GpuProtectionMode GpuProtection { get; set; } = GpuProtectionMode.Off;
     public int UiHotkeyKey { get; set; } = (int)Keys.Insert;
     public uint UiHotkeyModifiers { get; set; }
 }
@@ -66,7 +71,7 @@ internal static class SettingsStore
     }
     public static void Save(AppSettings settings)
     {
-        var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+        var json = Serialize(settings);
         lock (SaveSync)
         {
             _pendingJson = json;
@@ -74,16 +79,32 @@ internal static class SettingsStore
         }
     }
 
-    public static void Flush()
+    public static void SaveNow(AppSettings settings)
     {
-        string? json;
+        var json = Serialize(settings);
         lock (SaveSync)
         {
-            json = _pendingJson;
+            SaveTimer.Change(Timeout.Infinite, Timeout.Infinite);
             _pendingJson = null;
+            Write(json);
         }
+    }
 
-        if (json is null) return;
+    public static void Flush()
+    {
+        lock (SaveSync)
+        {
+            var json = _pendingJson;
+            _pendingJson = null;
+            if (json is not null) Write(json);
+        }
+    }
+
+    private static string Serialize(AppSettings settings) =>
+        JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+
+    private static void Write(string json)
+    {
         try
         {
             AppPaths.EnsureDataDirectory();

@@ -54,7 +54,7 @@ internal sealed class OverlayWindow : Form
                 monitor.Bounds.Y,
                 monitor.Bounds.Width,
                 monitor.Bounds.Height,
-                NativeMethods.SwpNoActivate | NativeMethods.SwpShowWindow);
+                NativeMethods.SwpNoActivate);
         }
     }
 

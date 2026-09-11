@@ -6,6 +6,18 @@ namespace Overlay;
 
 internal static class NativeMethods
 {
+    public const uint WdaNone = 0x00;
+    public const uint WdaMonitor = 0x01;
+    public const uint WdaExcludeFromCapture = 0x11;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint affinity);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetWindowDisplayAffinity(IntPtr hwnd, out uint affinity);
+
     public const int WsExLayered = 0x00080000;
     public const int WsExTransparent = 0x00000020;
     public const int WsExToolWindow = 0x00000080;

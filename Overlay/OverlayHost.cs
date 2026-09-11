@@ -11,6 +11,8 @@ internal sealed class OverlayHost : IDisposable
     private readonly ManualResetEventSlim _ready = new(false);
     private OverlayWindow? _window;
     private PerformanceHudWindow? _hud;
+    private WindowCaptureProtection? _overlayProtection;
+    private WindowCaptureProtection? _hudProtection;
     private ApplicationContext? _context;
     private bool _disposed;
 
@@ -34,6 +36,33 @@ internal sealed class OverlayHost : IDisposable
 
     public void SetHudMode(PerformanceHudMode mode, bool running) => InvokeOnWindow(() => _hud!.SetMode(mode, running));
 
+    public string OverlayCaptureStatus => _overlayProtection?.Status ?? "Pending";
+    public string HudCaptureStatus => _hudProtection?.Status ?? "Pending";
+
+    public void SetAntiCaptureMode(AntiCaptureMode mode) => InvokeOnWindow(() =>
+    {
+        _overlayProtection!.SetMode(mode);
+        _hudProtection!.SetMode(mode);
+    });
+
+    public void SetAntiCaptureModes(AntiCaptureMode overlayMode, AntiCaptureMode hudMode) => InvokeOnWindow(() =>
+    {
+        _overlayProtection!.SetMode(overlayMode);
+        _hudProtection!.SetMode(hudMode);
+    });
+
+    public WindowCapturePair InspectAntiCapture()
+    {
+        var overlay = WindowCaptureState.Unavailable;
+        var hud = WindowCaptureState.Unavailable;
+        InvokeOnWindow(() =>
+        {
+            overlay = _overlayProtection!.Inspect();
+            hud = _hudProtection!.Inspect();
+        });
+        return new WindowCapturePair(overlay, hud);
+    }
+
     public IntPtr OverlayHandle
     {
         get
@@ -52,6 +81,38 @@ internal sealed class OverlayHost : IDisposable
     public void HideOverlay()
     {
         InvokeOnWindow(() => _window!.HideOverlay());
+    }
+
+    public void ResetOutputWindow(MonitorInfo monitor, AntiCaptureMode mode)
+    {
+        InvokeOnWindow(() =>
+        {
+            // Discard any previously displayed CPU DIB before enabling GPU protection.
+            _window!.Dispose();
+            _window = new OverlayWindow();
+            _overlayProtection = new WindowCaptureProtection(_window);
+            _overlayProtection.SetMode(mode);
+            _ = _window.Handle;
+            _window.SetMonitor(monitor);
+        });
+    }
+
+    public void HideBlockedOutput(Func<bool> stillBlocked)
+    {
+        var window = _window;
+        if (window is null || window.IsDisposed) return;
+        try
+        {
+            // Never synchronously invoke the UI from a worker which Stop() joins.
+            window.BeginInvoke(new Action(() =>
+            {
+                if (_disposed || !stillBlocked()) return;
+                _window?.ClearFrame();
+                _window?.HideOverlay();
+                _hud?.SetMode(PerformanceHudMode.Off, false);
+            }));
+        }
+        catch (InvalidOperationException) { }
     }
 
     public void ClearFrame()
@@ -105,7 +166,10 @@ internal sealed class OverlayHost : IDisposable
 
         _window = new OverlayWindow();
         _hud = new PerformanceHudWindow();
+        _overlayProtection = new WindowCaptureProtection(_window);
+        _hudProtection = new WindowCaptureProtection(_hud);
         _ = _window.Handle;
+        _ = _hud.Handle;
         _context = new ApplicationContext();
         _ready.Set();
         Application.Run(_context);

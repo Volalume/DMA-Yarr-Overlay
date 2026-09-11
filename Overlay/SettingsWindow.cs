@@ -15,21 +15,25 @@ internal sealed class SettingsWindow : Form
     private HotkeyManager? _hotkeys;
     private PerformanceSnapshot? _performance;
     private long _nextPerformanceRefresh;
+    private long _nextProtectionVerification;
+    private CaptureProtectionVerification _protectionVerification = new(false, false, "CHECKING CURRENT STATE", "Waiting for the first verification.");
     private bool _bindingHotkey;
     private string? _notification;
     private long _thresholdHoldStarted;
     private long _lastThresholdRepeat;
     private int _lastThresholdHotkeyId;
-    private int _requestedClientHeight = 630;
+    private const int ControlWidth = 1120;
+    private const int ControlHeight = 700;
     private IntPtr _previousForegroundWindow;
     private bool _changingVisibility;
     private bool _disposed;
+    private static readonly string[] ProtectionLevelNames = { "Off", "Software Level", "Hardware Level", "Kernel Level" };
 
     public SettingsWindow(AppState state)
     {
         _state = state;
         Text = "YarrOverlay Control";
-        ClientSize = new Size(1120, _requestedClientHeight);
+        ClientSize = new Size(ControlWidth, ControlHeight);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = true;
@@ -248,21 +252,18 @@ internal sealed class SettingsWindow : Form
         {
             if (ImGui.BeginTabItem("Overlay"))
             {
-                RequestClientHeight(700);
                 DrawOverlayTab();
                 ImGui.EndTabItem();
             }
 
             if (ImGui.BeginTabItem("Performance"))
             {
-                RequestClientHeight(1100);
                 DrawPerformanceTab();
                 ImGui.EndTabItem();
             }
 
             if (ImGui.BeginTabItem("Settings"))
             {
-                RequestClientHeight(700);
                 DrawSettingsTab();
                 ImGui.EndTabItem();
             }
@@ -352,7 +353,7 @@ internal sealed class SettingsWindow : Form
         var recent = p?.TenSeconds ?? WindowPerformance.Empty;
 
         ImGui.Spacing();
-        BeginCard("LatencyCard", 150, "APP LATENCY");
+        BeginCard("LatencyCard", 120, "APP LATENCY");
         ImGui.PushFont(_controller!.MonoFont, 0);
         ImGui.TextColored(ImGuiTheme.AccentBright, $"{Format(p?.TotalAppLatencyEstimateMs),7} ms");
         ImGui.SameLine();
@@ -362,7 +363,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("TuningCard", 245, "PIPELINE");
+        BeginCard("TuningCard", 210, "PIPELINE");
         if (ImGui.BeginTable("TuningGrid", 2, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV))
         {
             ImGui.TableNextColumn();
@@ -391,7 +392,12 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("MetricsCard", 390, "METRICS");
+        // Only this card scrolls. Leave room for the footer without changing the
+        // window size or adding a clipping/scrolling surface around the whole tab.
+        var footerReserve = ImGui.GetTextLineHeightWithSpacing() * 2
+            + ImGui.GetStyle().WindowPadding.Y + ImGui.GetStyle().ItemSpacing.Y * 2;
+        var metricsHeight = Math.Max(1, ImGui.GetContentRegionAvail().Y - footerReserve);
+        BeginCard("MetricsCard", metricsHeight, "METRICS", scrollable: true);
         if (ImGui.BeginTable("StageMetrics", 3, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.RowBg))
         {
             ImGui.TableSetupColumn("Stage");
@@ -409,8 +415,6 @@ internal sealed class SettingsWindow : Form
             ImGui.EndTable();
         }
         ImGui.TextDisabled($"Queue {p?.QueueLength ?? 0}/{p?.MaxQueueLength ?? 0}  |  dropped {p?.DroppedFrames ?? 0}  |  replaced {p?.ReplacedFrames ?? 0}  |  DXGI errors {p?.DxgiErrors ?? 0}");
-        ImGui.EndChild();
-
         ImGui.Spacing();
         var hud = (int)_state.PerformanceHud;
         ImGui.SetNextItemWidth(170);
@@ -425,11 +429,20 @@ internal sealed class SettingsWindow : Form
         ImGui.SameLine();
         var latencyTest = _state.LatencyTestMode;
         if (ImGui.Checkbox("Latency test", ref latencyTest)) RunUiAction(() => _state.SetLatencyTestMode(latencyTest));
+        ImGui.EndChild(); // MetricsCard (the card itself owns scrolling)
     }
 
     private void DrawSettingsTab()
     {
         ImGui.Spacing();
+        if (ImGui.BeginTable("SettingsColumns", 2, ImGuiTableFlags.SizingStretchProp))
+        {
+        ImGui.TableSetupColumn("Protection", ImGuiTableColumnFlags.WidthStretch, 1.4f);
+        ImGui.TableSetupColumn("General", ImGuiTableColumnFlags.WidthStretch, 1f);
+        ImGui.TableNextRow();
+        ImGui.TableNextColumn();
+        DrawAntiCaptureSettings();
+        ImGui.TableNextColumn();
         BeginCard("WindowCard", 120, "WINDOW");
         var topMost = _state.AlwaysOnTop;
         if (ImGui.Checkbox("Always On Top", ref topMost))
@@ -441,7 +454,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("HotkeyCard", 190, "UI HOTKEY");
+        BeginCard("HotkeyCard", 150, "UI HOTKEY");
         ImGui.Text("UI Hotkey");
         ImGui.SameLine();
         var buttonText = _bindingHotkey ? "Press a key..." : $"[ {_state.UiHotkey.DisplayText} ]";
@@ -456,22 +469,77 @@ internal sealed class SettingsWindow : Form
         ImGui.Spacing();
         BeginCard("ShortcutsCard", 170, "SHORTCUTS");
         ImGui.PushFont(_controller!.MonoFont, 0);
-        ImGui.Text("Space        Start / stop overlay");
-        ImGui.Text("Global +/-   Adjust black threshold by one");
-        ImGui.Text($"{_state.UiHotkey.DisplayText,-12} Hide / show this control surface");
+        ImGui.TextWrapped("Space        Start / stop overlay");
+        ImGui.TextWrapped("Global +/-   Adjust black threshold by one");
+        ImGui.TextWrapped($"{_state.UiHotkey.DisplayText,-12} Hide / show this control surface");
         ImGui.PopFont();
+        ImGui.EndChild();
+        ImGui.EndTable();
+        }
+    }
+
+    private void DrawAntiCaptureSettings()
+    {
+        BeginCard("AntiCaptureCard", 200, "ANTI-CAPTURE");
+        var level = _state.ProtectionLevel;
+        ImGui.SetNextItemWidth(-1);
+        if (ImGui.BeginCombo("##ProtectionLevel", ProtectionLevelNames[(int)level]))
+        {
+            for (var i = 0; i < ProtectionLevelNames.Length; i++)
+            {
+                var candidate = (CaptureProtectionLevel)i;
+                var unavailable = candidate == CaptureProtectionLevel.Kernel;
+                if (ImGui.Selectable(ProtectionLevelNames[i], candidate == level,
+                    unavailable ? ImGuiSelectableFlags.Disabled : ImGuiSelectableFlags.None))
+                    RunUiAction(() => _state.SetProtectionLevel(candidate));
+                if (unavailable && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    ImGui.SetTooltip("Not implemented.");
+                if (candidate == level) ImGui.SetItemDefaultFocus();
+            }
+            ImGui.EndCombo();
+        }
+        level = _state.ProtectionLevel;
+        if (level == CaptureProtectionLevel.Software)
+        {
+            var appearance = _state.AntiCapture == AntiCaptureMode.Black ? 0 : 1;
+            ImGui.SetNextItemWidth(180);
+            if (ImGui.Combo("Capture result", ref appearance, "Black\0Exclude\0"))
+                RunUiAction(() => _state.SetAntiCaptureMode(appearance == 0 ? AntiCaptureMode.Black : AntiCaptureMode.Exclude));
+        }
+
+        RefreshProtectionVerification();
+        var verificationColor = _protectionVerification.Failed ? ImGuiTheme.Warning
+            : _protectionVerification.Verified ? ImGuiTheme.Good : ImGuiTheme.Accent;
+        ImGui.PushTextWrapPos(0);
+        ImGui.TextColored(verificationColor, $"● {_protectionVerification.Label}");
+        ImGui.PopTextWrapPos();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(_protectionVerification.Detail);
+
+        var status = _state.GpuOutputStatus;
+        if (level == CaptureProtectionLevel.Hardware && status.Blocked && ImGui.Button("Retry")) RunUiAction(_state.Start);
+
         ImGui.EndChild();
     }
 
-    private void BeginCard(string id, float height, string title)
+    private void BeginCard(string id, float height, string title, bool scrollable = false)
     {
         ImGui.BeginChild(
             id,
             new Vector2(0, height),
             ImGuiChildFlags.Borders,
-            ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
+            scrollable ? ImGuiWindowFlags.AlwaysVerticalScrollbar
+                : ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
         ImGui.TextColored(ImGuiTheme.Accent, title);
         ImGui.Separator();
+    }
+
+    private void RefreshProtectionVerification()
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (now < _nextProtectionVerification) return;
+        _nextProtectionVerification = now + Stopwatch.Frequency / 2;
+        try { _protectionVerification = _state.InspectCaptureProtection(); }
+        catch (Exception ex) { _protectionVerification = new(false, true, "VERIFICATION FAILED", ex.Message); }
     }
 
     private void DrawMetricRow(string label, TimingStats stats, TimingStats? secondary = null)
@@ -585,21 +653,6 @@ internal sealed class SettingsWindow : Form
         {
             if (attached) NativeMethods.AttachThreadInput(currentThread, foregroundThread, false);
         }
-    }
-
-    private void RequestClientHeight(int height)
-    {
-        if (_requestedClientHeight == height || !IsHandleCreated) return;
-        _requestedClientHeight = height;
-        BeginInvoke(new Action(() =>
-        {
-            if (IsDisposed || ClientSize.Height == height) return;
-            var center = new Point(Left + Width / 2, Top + Height / 2);
-            ClientSize = new Size(ClientSize.Width, height);
-            var workingArea = Screen.FromHandle(Handle).WorkingArea;
-            Left = Math.Clamp(center.X - Width / 2, workingArea.Left, Math.Max(workingArea.Left, workingArea.Right - Width));
-            Top = Math.Clamp(center.Y - Height / 2, workingArea.Top, Math.Max(workingArea.Top, workingArea.Bottom - Height));
-        }));
     }
 
     private int GetThresholdHotkeyStep(int hotkeyId)
