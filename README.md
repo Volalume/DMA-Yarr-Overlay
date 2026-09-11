@@ -4,7 +4,7 @@
 
 YarrOverlay replaces the display-compositing role of a hardware DMA Fuser with a Windows application. It captures a live monitor source, removes black and near-black pixels, and presents the remaining image as a transparent, topmost, click-through overlay on another monitor.
 
-The normal path stays on the GPU: DXGI Desktop Duplication captures the source, a D3D11 shader performs chroma removal, scaling, and sharpening, and DirectComposition presents the result. A virtual display running a full-screen Parsec session is the intended source, but any separate active Windows display can be used.
+The normal path stays on the GPU: DXGI Desktop Duplication captures the source, a D3D11 shader performs chroma removal, scaling, and sharpening, and DirectComposition presents the result. When **Hardware Level** protection is selected, the source switches to Windows Graphics Capture so Parsec's virtual-display transitions do not invalidate Desktop Duplication; the protected DirectComposition output remains unchanged. A virtual display running a full-screen Parsec session is the intended source, but any separate active Windows display can be used.
 
 ## Highlights
 
@@ -80,7 +80,7 @@ Open **Settings → Anti-Capture** and select one level:
 
 - **Off:** normal capture behavior.
 - **Software Level:** uses Windows display affinity for both the output overlay and latency HUD. `Black` returns a black protected region in supported capture paths; `Exclude` omits the protected windows so the desktop underneath can remain visible.
-- **Hardware Level:** experimental. Requires `Auto` or `GPU Native`, both displays on the same GPU, and compatible WDDM/GPU drivers. It combines verified `Black` window affinity with a `HW_PROTECTED | DISPLAY_ONLY` GPU swap chain. It never falls back to an unprotected or CPU path while selected.
+- **Hardware Level:** experimental. Requires `Auto` or `GPU Native`, both displays on the same GPU, and compatible WDDM/GPU drivers. It combines verified `Black` window affinity with a `HW_PROTECTED | DISPLAY_ONLY` GPU swap chain. Its source uses Windows Graphics Capture instead of Desktop Duplication to avoid Parsec/VDD invalidation. It never falls back to an unprotected or CPU path while selected.
 - **Kernel Level:** reserved in the UI and not implemented.
 
 Changing a level or switching between `Black` and `Exclude` rebuilds the output window and renderer immediately; restarting YarrOverlay is not required. The colored label reads the current Windows value with `GetWindowDisplayAffinity` instead of repeating the selected option:
@@ -99,7 +99,7 @@ Anti-Capture is a best-effort Windows content-protection feature, not DRM or a g
 - **Nothing appears after Start:** ensure Capture and Output are different active displays and Parsec is visible on the selected source.
 - **The pipeline shows Legacy CPU:** place both displays on the same GPU or inspect the log for the GPU Native initialization error.
 - **Hardware Level shows Blocked:** select `Auto` or `GPU Native`, verify the same-adapter route, then press **Retry**. No unprotected fallback is attempted.
-- **Game Bar interrupts the source:** YarrOverlay keeps the last protected output attached and reconnects input capture automatically after `Win + G` transitions.
+- **Game Bar or Parsec interrupts the source:** Hardware Level uses Windows Graphics Capture for the source; if the session still closes, press **Stop Overlay**, reconnect Parsec, and press **Start Overlay**. Software Level retains the Desktop Duplication path and reconnects it after normal display transitions.
 - **Black/Exclude looks unchanged:** check the colored label first. A green label confirms the Windows affinity value; the capture application may not support that policy or may need its capture session restarted.
 - **Dark content disappears:** lower **Black Threshold**.
 - **Edges look oversharpened:** lower **Sharpness**. It uses the same shader pass and has negligible latency impact.

@@ -40,10 +40,14 @@ internal sealed class DuplicationCapture : IDisposable
         // An unknown nonzero mode must fail closed too, not bypass this policy.
         var requireProtection = _options.GpuProtection != GpuProtectionMode.Off;
         var protectionPresented = false;
-        var failures = 0; long dropped = 0; var recreateCount = 0; var frames = 0; var fpsClock = Stopwatch.StartNew(); DateTimeOffset? lastFrame = null; var lastError = ""; long recoveryStarted = 0; double lastRecoveryMs = 0, totalRecoveryMs = 0;
+        var failures = 0; long dropped = 0; var recreateCount = 0; var frames = 0; long frameSequence = 0, acquireCalls = 0, submittedFrames = 0, lastLossTick = 0; var pipelineStage = "starting"; var fpsClock = Stopwatch.StartNew(); DateTimeOffset? lastFrame = null; var lastError = ""; long recoveryStarted = 0; double lastRecoveryMs = 0, totalRecoveryMs = 0;
         IntPtr mmcss = IntPtr.Zero; if (_options.EnableMmcss) { mmcss = NativeMethods.AvSetMmThreadCharacteristics("Games", out _); if (mmcss == IntPtr.Zero) Logger.Error($"MMCSS registration failed: {Marshal.GetLastWin32Error()}"); }
         using var csv = _options.CsvEnabled ? new PerformanceCsvWriter() : null;
-        var collectMetrics = _options.MetricsMode != MetricsMode.Off;
+        // The HUD's total latency value is sourced from LatencyMetrics. Keep the
+        // lightweight submission samples enabled whenever Hardware Protection is
+        // active so the protected WGC path still reports an ms value even if the
+        // user selected Metrics: Off. Detailed GPU timing remains opt-in.
+        var collectMetrics = _options.MetricsMode != MetricsMode.Off || _options.GpuProtection == GpuProtectionMode.HardwareRequired;
         var spin = new SpinWait();
         try
         {
@@ -56,7 +60,8 @@ internal sealed class DuplicationCapture : IDisposable
                 if (!Enum.IsDefined(_options.GpuProtection)) throw new InvalidOperationException("Unknown GPU protection mode.");
                 if (requireProtection && (_options.PipelineMode == PipelineMode.LegacyCpu || !sameAdapter))
                     throw new NotSupportedException("Protected output requires Auto/GPU Native and both displays on the same GPU. CPU fallback is disabled.");
-                using var context = CreateContext(_input, _output);
+                using var context = CreateContext(_input, _output, requireProtection);
+                Logger.Info($"Capture diagnostics: input={_input.Identity} output={_output.Identity} sameAdapter={sameAdapter} protection={_options.GpuProtection} pipeline={_options.PipelineMode} source={context.InputWidth}x{context.InputHeight} target={context.OutputWidth}x{context.OutputHeight}");
                 // Keep profiling queries out of the experimental protected command path.
                 using var gpuTimestamps = _options.MetricsMode == MetricsMode.DetailedGpu && !requireProtection ? new GpuTimestampCollector(context.Device) : null;
                 GpuOverlayRenderer? gpu = null;
@@ -72,60 +77,91 @@ internal sealed class DuplicationCapture : IDisposable
                 if (recoveryStarted != 0) { lastRecoveryMs = FrameTiming.Ms(recoveryStarted, FrameTiming.Now); totalRecoveryMs += lastRecoveryMs; recoveryStarted = 0; }
                 using (gpu)
                 {
-                Logger.Info($"Duplication created successfully for {_input.DeviceName} on {_input.AdapterName}.");
+                Logger.Info($"Capture source ready: backend={context.CaptureBackend}; device={_input.DeviceName}; adapter={_input.AdapterName}.");
                 while (!token.IsCancellationRequested)
                 {
+                    pipelineStage = "ValidateProtection";
                     gpu?.ValidateProtectionIfDue();
                     IDXGIResource? resource = null;
+                    ID3D11Texture2D? sourceTexture = null;
                     try
                     {
                         var timing = new FrameTiming { AcquireCallStart = FrameTiming.Now };
-                        var result = context.Duplication.AcquireNextFrame(0, out var frameInfo, out resource);
-                        timing.AcquireReturned = FrameTiming.Now; timing.DesktopPresentTime = frameInfo.LastPresentTime; timing.DesktopMouseUpdateTime = frameInfo.LastMouseUpdateTime; timing.AccumulatedFrames = (int)frameInfo.AccumulatedFrames; timing.TotalMetadataBufferSize = frameInfo.TotalMetadataBufferSize; timing.PointerVisible = frameInfo.PointerPosition.Visible; timing.ProtectedContentMaskedOut = frameInfo.ProtectedContentMaskedOut;
-                        if (result.Failure)
+                        acquireCalls++;
+                        var accumulatedFrames = 1;
+                        long desktopPresentTime = 0, desktopMouseUpdateTime = 0;
+                        uint metadataSize = 0;
+                        bool pointerVisible = false, protectedMaskedOut = false;
+                        if (context.Wgc is not null)
                         {
-                            if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { if(collectMetrics)_metrics.RecordTimeout(); spin.SpinOnce(); continue; }
-                            if(collectMetrics)_metrics.RecordDxgiError();
-                            failures++; var error = $"AcquireNextFrame failed: 0x{result.Code:X8}"; lastError = error; Logger.Error(error);
-                            if (requireProtection && IsDuplicationOnlyRecovery(result.Code))
+                            pipelineStage = "WgcTryGetNextFrame";
+                            sourceTexture = context.Wgc.TryGetNextTexture();
+                            timing.AcquireReturned = FrameTiming.Now;
+                            if (sourceTexture is null)
                             {
-                                recreateCount++;
-                                if (recoveryStarted == 0) recoveryStarted = FrameTiming.Now;
-                                protectionPresented = false;
-                                Volatile.Write(ref _gpuProtectionStatus, new(false, false, "Capture reconnecting", $"{error}; the protected output surface remains attached."));
-                                Logger.Info($"Protected input duplication lost; preserving the output surface and recreating input only: {error}");
-                                // Game Bar and secure-desktop transitions can invalidate
-                                // Desktop Duplication repeatedly. Keep the last protected
-                                // frame attached instead of tearing down the full-screen
-                                // DirectComposition surface on every transition.
-                                Thread.Sleep(250);
-                                context.RecreateDuplication(() => CreateDuplication(context.Factory, context.Device, _input!));
+                                if(collectMetrics)_metrics.RecordTimeout();
+                                spin.SpinOnce();
                                 continue;
                             }
-                            if (IsRecoverable(result.Code))
-                            {
-                                recreateCount++;
-                                if (recoveryStarted == 0) recoveryStarted = FrameTiming.Now;
-                                if (!requireProtection) RecreateRequested?.Invoke(error);
-                                break;
-                            }
-                            if (requireProtection) throw new InvalidOperationException(error);
-                            Thread.Yield(); continue;
+                            desktopPresentTime = timing.AcquireReturned;
+                            timing.DesktopPresentTime = desktopPresentTime;
                         }
-                        spin.Reset(); if(collectMetrics)_metrics.RecordCaptured((int)frameInfo.AccumulatedFrames);
-                        if (frameInfo.LastPresentTime == 0) continue;
-                        using var texture = resource.QueryInterface<ID3D11Texture2D>();
+                        else
+                        {
+                            pipelineStage = "AcquireNextFrame";
+                            var result = context.Duplication!.AcquireNextFrame(0, out var frameInfo, out resource);
+                            timing.AcquireReturned = FrameTiming.Now; timing.DesktopPresentTime = frameInfo.LastPresentTime; timing.DesktopMouseUpdateTime = frameInfo.LastMouseUpdateTime; timing.AccumulatedFrames = (int)frameInfo.AccumulatedFrames; timing.TotalMetadataBufferSize = frameInfo.TotalMetadataBufferSize; timing.PointerVisible = frameInfo.PointerPosition.Visible; timing.ProtectedContentMaskedOut = frameInfo.ProtectedContentMaskedOut;
+                            accumulatedFrames = (int)frameInfo.AccumulatedFrames; desktopPresentTime = frameInfo.LastPresentTime; desktopMouseUpdateTime = frameInfo.LastMouseUpdateTime; metadataSize = frameInfo.TotalMetadataBufferSize; pointerVisible = frameInfo.PointerPosition.Visible; protectedMaskedOut = frameInfo.ProtectedContentMaskedOut;
+                            if (result.Failure)
+                            {
+                                if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { if(collectMetrics)_metrics.RecordTimeout(); spin.SpinOnce(); continue; }
+                                if(collectMetrics)_metrics.RecordDxgiError();
+                                failures++; var error = $"AcquireNextFrame failed: 0x{result.Code:X8}"; lastError = error;
+                                var sinceLoss = lastLossTick == 0 ? -1 : FrameTiming.Ms(lastLossTick, FrameTiming.Now);
+                                Logger.Error($"{error}; stage={pipelineStage}; acquireCalls={acquireCalls}; frames={frameSequence}; submitted={submittedFrames}; accumulated={frameInfo.AccumulatedFrames}; lastPresent={frameInfo.LastPresentTime}; lastMouse={frameInfo.LastMouseUpdateTime}; metadata={frameInfo.TotalMetadataBufferSize}; sincePreviousLossMs={sinceLoss:F2}; {gpu?.DescribeRuntimeState() ?? "gpu=none"}");
+                                lastLossTick = FrameTiming.Now;
+                                if (requireProtection && IsDuplicationOnlyRecovery(result.Code))
+                                {
+                                    recreateCount++;
+                                    if (recoveryStarted == 0) recoveryStarted = FrameTiming.Now;
+                                    protectionPresented = false;
+                                    Volatile.Write(ref _gpuProtectionStatus, new(false, false, "Capture reconnecting", $"{error}; the protected output surface remains attached."));
+                                    Logger.Info($"Protected input duplication lost; preserving the output surface and recreating input only: {error}; recovery={recreateCount}");
+                                    Thread.Sleep(250);
+                                    pipelineStage = "RecreateInputDuplication";
+                                    context.RecreateDuplication(() => CreateDuplication(context.Factory, context.Device, _input!));
+                                    Logger.Info($"Input duplication recreated successfully; output state: {gpu?.DescribeRuntimeState() ?? "gpu=none"}");
+                                    continue;
+                                }
+                                if (IsRecoverable(result.Code))
+                                {
+                                    recreateCount++;
+                                    if (recoveryStarted == 0) recoveryStarted = FrameTiming.Now;
+                                    if (!requireProtection) RecreateRequested?.Invoke(error);
+                                    break;
+                                }
+                                if (requireProtection) throw new InvalidOperationException(error);
+                                Thread.Yield(); continue;
+                            }
+                            if (desktopPresentTime == 0) continue;
+                            sourceTexture = resource!.QueryInterface<ID3D11Texture2D>();
+                        }
+                        timing.DesktopMouseUpdateTime = desktopMouseUpdateTime; timing.AccumulatedFrames = accumulatedFrames; timing.TotalMetadataBufferSize = metadataSize; timing.PointerVisible = pointerVisible; timing.ProtectedContentMaskedOut = protectedMaskedOut;
+                        spin.Reset(); if(collectMetrics)_metrics.RecordCaptured(accumulatedFrames);
+                        frameSequence++;
+                        pipelineStage = "CopyResource";
                         if (gpuTimestamps is not null)
                         {
                             gpuTimestamps.TryCollect(context.DeviceContext, out timing.GpuCopyMs, out timing.GpuShaderMs, out timing.GpuTotalMs);
                             gpuTimestamps.Begin(context.DeviceContext);
                         }
-                        context.DeviceContext.CopyResource(context.SourceTexture, texture); timing.SourceCopySubmitted = FrameTiming.Now;
+                        context.DeviceContext.CopyResource(context.SourceTexture, sourceTexture); timing.SourceCopySubmitted = FrameTiming.Now;
                         gpuTimestamps?.CopyFinished(context.DeviceContext);
                         UpdateShaderParamsIfChanged(context);
                         var renderTarget = gpu?.CurrentRenderTarget ?? context.LegacyRtv!;
                         try
                         {
+                            pipelineStage = "Draw";
                             gpu?.BeginDraw();
                             context.DeviceContext.OMSetRenderTargets(renderTarget); context.DeviceContext.RSSetViewport(0, 0, context.OutputWidth, context.OutputHeight);
                             context.DeviceContext.IASetPrimitiveTopology(PrimitiveTopology.TriangleList); context.DeviceContext.VSSetShader(context.Vs); context.DeviceContext.PSSetShader(context.Ps);
@@ -137,6 +173,7 @@ internal sealed class DuplicationCapture : IDisposable
 
                         if (gpu is not null)
                         {
+                            pipelineStage = "Present";
                             timing.SubmitStarted = FrameTiming.Now; var present = gpu.Present(); timing.SubmitReturned = FrameTiming.Now;
                             if (present.Backlogged) { timing.FrameDroppedOrReplaced = FrameTiming.Now; dropped++; if(collectMetrics)_metrics.RecordDropped(); continue; }
                             if (!present.Submitted)
@@ -157,6 +194,9 @@ internal sealed class DuplicationCapture : IDisposable
                                 Volatile.Write(ref _gpuProtectionStatus, new(false, true, "Driver accepted / presenting", gpu.ProtectionDetails));
                                 Logger.Info($"GPU protection: {gpu.ProtectionDetails}");
                             }
+                            submittedFrames++;
+                            if (frameSequence % 120 == 0)
+                                Logger.Info($"Protected frame sample: frame={frameSequence}; acquireCalls={acquireCalls}; submitted={submittedFrames}; accumulated={accumulatedFrames}; presentCode=0x{present.ResultCode:X8}; {gpu.DescribeRuntimeState()}");
                             if (present.HasStatistics) { timing.PresentCount=present.Statistics.PresentCount; timing.PresentRefreshCount=present.Statistics.PresentRefreshCount; timing.SyncRefreshCount=present.Statistics.SyncRefreshCount; timing.PresentSyncQpcTime=present.Statistics.SyncQPCTime; }
                             if(collectMetrics) LatencyMetrics.Global.RecordSubmitted(timing); lastFrame = DateTimeOffset.Now; frames++;
                             if (csv is not null && timing.FrameId % _options.CsvIntervalFrames == 0) csv.TryWrite(timing, pipelineName, _input.AdapterName, _output.AdapterName, 0, present.ResultCode);
@@ -174,13 +214,14 @@ internal sealed class DuplicationCapture : IDisposable
                         lastFrame = DateTimeOffset.Now; frames++;
                         PublishDiagnosticsIfDue(ref frames, fpsClock, dropped, failures, lastFrame, recreateCount, pipelineName, csv?.LostRows ?? 0, lastError, lastRecoveryMs, totalRecoveryMs);
                     }
-                    finally { if (resource is not null) { context.Duplication.ReleaseFrame(); resource.Dispose(); } }
+                    finally { sourceTexture?.Dispose(); if (resource is not null) { context.Duplication!.ReleaseFrame(); resource.Dispose(); } }
                 }
                 }
             }
             catch (Exception ex)
             {
                 if (token.IsCancellationRequested) break;
+                Logger.Error($"Capture loop exception: stage={pipelineStage}; acquireCalls={acquireCalls}; frames={frameSequence}; submitted={submittedFrames}; {ex.GetType().Name}: {ex.Message} (0x{ex.HResult:X8})");
                 if (requireProtection && IsRecoverable(ex.HResult))
                 {
                     recreateCount++; failures++; lastError = $"{ex.GetType().Name}: {ex.Message}";
@@ -228,7 +269,7 @@ internal sealed class DuplicationCapture : IDisposable
         c.DeviceContext.UpdateSubresource(value,c.Params); c.LastParams=value; c.HasParams=true;
     }
     private static float RotationValue(string rotation) => rotation.Contains("Rotate90", StringComparison.OrdinalIgnoreCase) ? 1 : rotation.Contains("Rotate180", StringComparison.OrdinalIgnoreCase) ? 2 : rotation.Contains("Rotate270", StringComparison.OrdinalIgnoreCase) ? 3 : 0;
-    private CaptureContext CreateContext(MonitorInfo input, MonitorInfo output)
+    private CaptureContext CreateContext(MonitorInfo input, MonitorInfo output, bool useWgc)
     {
         var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
         try
@@ -248,20 +289,26 @@ internal sealed class DuplicationCapture : IDisposable
                         ID3D11Device? device = null;
                         ID3D11DeviceContext? dc = null;
                         IDXGIOutputDuplication? duplication = null;
+                        GraphicsCaptureSource? wgc = null;
                         try
                         {
                             var cr = D3D11CreateDevice(adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport,
                                 new[] { FeatureLevel.Level_11_1, FeatureLevel.Level_11_0, FeatureLevel.Level_10_1, FeatureLevel.Level_10_0 },
                                 out device, out _, out dc);
                             cr.CheckError();
-                            using var output1 = dxgiOutput.QueryInterface<IDXGIOutput1>();
-                            duplication = output1.DuplicateOutput(device);
+                            if (useWgc)
+                                wgc = GraphicsCaptureSource.Create(device, input);
+                            else
+                            {
+                                using var output1 = dxgiOutput.QueryInterface<IDXGIOutput1>();
+                                duplication = output1.DuplicateOutput(device);
+                            }
                             // Ownership transfers only after all initialization succeeds.
-                            return new CaptureContext(factory, device, dc, duplication, input.Bounds.Width, input.Bounds.Height, output.Bounds.Width, output.Bounds.Height);
+                            return new CaptureContext(factory, device, dc, duplication, wgc, input.Bounds.Width, input.Bounds.Height, output.Bounds.Width, output.Bounds.Height);
                         }
                         catch
                         {
-                            duplication?.Dispose(); dc?.Dispose(); device?.Dispose();
+                            wgc?.Dispose(); duplication?.Dispose(); dc?.Dispose(); device?.Dispose();
                             throw;
                         }
                     }
@@ -302,11 +349,11 @@ float4 PSMain(O i):SV_TARGET { float2 uv=(i.uv-float2(.5,.5))/float2(scaleX,scal
 """;
     private sealed class CaptureContext : IDisposable
     {
-        public readonly IDXGIFactory1 Factory; public readonly ID3D11Device Device; public readonly ID3D11DeviceContext DeviceContext; public IDXGIOutputDuplication Duplication { get; private set; } public readonly ID3D11Texture2D SourceTexture; public ID3D11Texture2D? LegacyOutputTexture, LegacyStaging; public readonly ID3D11ShaderResourceView Srv; public ID3D11RenderTargetView? LegacyRtv; public readonly ID3D11SamplerState Sampler; public readonly ID3D11VertexShader Vs; public readonly ID3D11PixelShader Ps; public readonly ID3D11Buffer Params; public readonly int InputWidth, InputHeight, OutputWidth, OutputHeight;
+        public readonly IDXGIFactory1 Factory; public readonly ID3D11Device Device; public readonly ID3D11DeviceContext DeviceContext; public IDXGIOutputDuplication? Duplication { get; private set; } public readonly GraphicsCaptureSource? Wgc; public string CaptureBackend => Wgc is null ? "Desktop Duplication" : "Windows Graphics Capture"; public readonly ID3D11Texture2D SourceTexture; public ID3D11Texture2D? LegacyOutputTexture, LegacyStaging; public readonly ID3D11ShaderResourceView Srv; public ID3D11RenderTargetView? LegacyRtv; public readonly ID3D11SamplerState Sampler; public readonly ID3D11VertexShader Vs; public readonly ID3D11PixelShader Ps; public readonly ID3D11Buffer Params; public readonly int InputWidth, InputHeight, OutputWidth, OutputHeight;
         public ShaderParams LastParams; public bool HasParams;
-        public CaptureContext(IDXGIFactory1 f, ID3D11Device d, ID3D11DeviceContext c, IDXGIOutputDuplication dup, int iw, int ih, int ow, int oh)
+        public CaptureContext(IDXGIFactory1 f, ID3D11Device d, ID3D11DeviceContext c, IDXGIOutputDuplication? dup, GraphicsCaptureSource? wgc, int iw, int ih, int ow, int oh)
         {
-            Factory=f; Device=d; DeviceContext=c; Duplication=dup; InputWidth=iw; InputHeight=ih; OutputWidth=ow; OutputHeight=oh;
+            Factory=f; Device=d; DeviceContext=c; Duplication=dup; Wgc=wgc; InputWidth=iw; InputHeight=ih; OutputWidth=ow; OutputHeight=oh;
             try
             {
                 SourceTexture=d.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,(uint)iw,(uint)ih,1,1,BindFlags.ShaderResource,ResourceUsage.Default,CpuAccessFlags.None,1,0,ResourceOptionFlags.None));
@@ -325,10 +372,11 @@ float4 PSMain(O i):SV_TARGET { float2 uv=(i.uv-float2(.5,.5))/float2(scaleX,scal
         }
         public void RecreateDuplication(Func<IDXGIOutputDuplication> create)
         {
+            if (Duplication is null) throw new InvalidOperationException("Desktop Duplication is not active for this capture source.");
             Duplication.Dispose();
             Duplication = create();
         }
         public void EnsureLegacyResources(){if(LegacyOutputTexture is not null)return;LegacyOutputTexture=Device.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,(uint)OutputWidth,(uint)OutputHeight,1,1,BindFlags.RenderTarget,ResourceUsage.Default,CpuAccessFlags.None,1,0,ResourceOptionFlags.None));LegacyRtv=Device.CreateRenderTargetView(LegacyOutputTexture);LegacyStaging=Device.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,(uint)OutputWidth,(uint)OutputHeight,1,1,BindFlags.None,ResourceUsage.Staging,CpuAccessFlags.Read,1,0,ResourceOptionFlags.None));}
-        public void Dispose(){ Params.Dispose(); Ps.Dispose(); Vs.Dispose(); Sampler.Dispose(); LegacyStaging?.Dispose(); LegacyRtv?.Dispose(); LegacyOutputTexture?.Dispose(); Srv.Dispose(); SourceTexture.Dispose(); Duplication.Dispose(); DeviceContext.Dispose(); Device.Dispose(); Factory.Dispose(); }
+        public void Dispose(){ Params.Dispose(); Ps.Dispose(); Vs.Dispose(); Sampler.Dispose(); LegacyStaging?.Dispose(); LegacyRtv?.Dispose(); LegacyOutputTexture?.Dispose(); Srv.Dispose(); SourceTexture.Dispose(); Wgc?.Dispose(); Duplication?.Dispose(); DeviceContext.Dispose(); Device.Dispose(); Factory.Dispose(); }
     }
 }

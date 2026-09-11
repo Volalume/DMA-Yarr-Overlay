@@ -56,8 +56,10 @@ internal sealed class GpuOverlayRenderer : IDisposable
                 protectedContext.HardwareProtectionState = true;
                 if (!protectedContext.HardwareProtectionState)
                     throw new NotSupportedException("D3D11 context did not enable hardware protection.");
-                protectedContext.HardwareProtectionState = false;
-                protectionDetails = $"WDDM {version / 1000}.{version % 1000 / 100}; HW buffers + display-only flags accepted. Not capture-tested or attested.";
+                // Keep the context inside one protected command session for the
+                // lifetime of the swap chain. Toggling this state for every moving
+                // frame can invalidate Desktop Duplication on some WDDM drivers.
+                protectionDetails = $"WDDM {version / 1000}.{version % 1000 / 100}; HW buffers + display-only flags accepted; protected command state retained. Not capture-tested or attested.";
             }
             // Exact composition format/alpha/flags are the support probe. Never retry
             // without protection flags if this fails (including on virtual adapters).
@@ -101,16 +103,24 @@ internal sealed class GpuOverlayRenderer : IDisposable
     public void BeginDraw()
     {
         if (_protectedContext is null) return;
-        _protectedContext.HardwareProtectionState = true;
         if (!_protectedContext.HardwareProtectionState)
             throw new InvalidOperationException("D3D11 hardware protection state was lost.");
     }
 
-    public void EndDraw() { if (_protectedContext is not null) _protectedContext.HardwareProtectionState = false; }
+    public void EndDraw() { }
+
+    public string DescribeRuntimeState()
+    {
+        var desc = _swapChain.Description1;
+        var removed = _device.DeviceRemovedReason;
+        var protectedState = _protectedContext is not null && _protectedContext.HardwareProtectionState;
+        return $"swapFlags={desc.Flags}; buffers={desc.BufferCount}; effect={desc.SwapEffect}; alpha={desc.AlphaMode}; deviceRemoved=0x{removed.Code:X8}; protectionState={protectedState}";
+    }
 
     // Runs on the owning capture thread, including when the source is static.
-    // No readback, waits, or per-frame resource queries. These are driver-reported
-    // invariants, not attestation or a detector for other programs taking captures.
+    // Runs on the owning capture thread, including when the source is static.
+    // These are driver-reported invariants, not attestation or a detector for other
+    // programs taking captures.
     public void ValidateProtectionIfDue()
     {
         if (_protectedContext is null) return;
@@ -118,10 +128,14 @@ internal sealed class GpuOverlayRenderer : IDisposable
         if (now < _nextProtectionCheck) return;
         _nextProtectionCheck = now + Stopwatch.Frequency;
         _device.DeviceRemovedReason.CheckError();
+        if (!_protectedContext.HardwareProtectionState)
+            throw new InvalidOperationException("D3D11 hardware protection state was lost.");
         var desc = _swapChain.Description1;
         const SwapChainFlags required = SwapChainFlags.HwProtected | SwapChainFlags.DisplayOnly;
         if ((desc.Flags & required) != required || desc.BufferCount != 2 || desc.SwapEffect != SwapEffect.FlipSequential)
             throw new InvalidOperationException("Protected swap-chain configuration changed.");
+        // Keep the runtime buffer check enabled: creation-time validation alone is
+        // not sufficient if a driver changes or replaces a protected allocation.
         for (uint i = 0; i < desc.BufferCount; i++)
         {
             using var buffer = _swapChain.GetBuffer<ID3D11Texture2D>(i);
@@ -148,8 +162,8 @@ internal sealed class GpuOverlayRenderer : IDisposable
     public void Dispose()
     {
         if (_disposed) return; _disposed = true;
-        EndDraw();
         _visual.SetContent(null); _target.SetRoot(null); _composition.Commit();
+        if (_protectedContext is not null) _protectedContext.HardwareProtectionState = false;
         foreach (var rtv in _rtvs) rtv.Dispose();
         _visual.Dispose(); _target.Dispose(); _composition.Dispose(); _swapChain.Dispose(); _protectedContext?.Dispose();
     }

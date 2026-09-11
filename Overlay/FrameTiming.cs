@@ -133,5 +133,8 @@ internal sealed record PerformanceSnapshot(long CapturedFrames, long SubmittedFr
     public TimingStats Pipeline => TenSeconds.Pipeline; public TimingStats MapWait => TenSeconds.MapWait; public TimingStats CpuCopy => TenSeconds.CpuCopy; public TimingStats UiQueue => TenSeconds.UiQueue;
     // Closest non-blocking app-side latency estimate: source desktop present to
     // overlay submission. Physical output scan-out is intentionally not included.
-    public double TotalAppLatencyEstimateMs => OneSecond.DesktopToSubmit.Current;
+    public double TotalAppLatencyEstimateMs =>
+        double.IsNaN(OneSecond.DesktopToSubmit.Current)
+            ? TenSeconds.DesktopToSubmit.Current
+            : OneSecond.DesktopToSubmit.Current;
 }
