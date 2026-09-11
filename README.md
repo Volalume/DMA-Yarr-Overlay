@@ -13,10 +13,8 @@ The normal path stays on the GPU: DXGI Desktop Duplication captures the source, 
 - Independent capture and output display routing
 - Transparent, topmost, click-through full-screen output
 - Compact latency HUD, detailed metrics, and optional CSV diagnostics
-- Automatic recovery from display changes, Game Bar transitions, and lost DXGI duplication sessions
 - Unified Anti-Capture levels with live Windows affinity and GPU protection verification
 - Legacy CPU fallback for unsupported or cross-adapter routes
-- Fixed-size control panel with scrolling contained inside the Metrics card
 
 ## Setup Guide
 
