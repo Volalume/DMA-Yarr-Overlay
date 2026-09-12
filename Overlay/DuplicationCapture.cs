@@ -61,7 +61,7 @@ internal sealed class DuplicationCapture : IDisposable
                 if (requireProtection && (_options.PipelineMode == PipelineMode.LegacyCpu || !sameAdapter))
                     throw new NotSupportedException("Protected output requires Auto/GPU Native and both displays on the same GPU. CPU fallback is disabled.");
                 using var context = CreateContext(_input, _output, requireProtection);
-                Logger.Info($"Capture diagnostics: input={_input.Identity} output={_output.Identity} sameAdapter={sameAdapter} protection={_options.GpuProtection} pipeline={_options.PipelineMode} source={context.InputWidth}x{context.InputHeight} target={context.OutputWidth}x{context.OutputHeight}");
+                Logger.Info($"Capture: {_input.Identity} -> {_output.Identity}; {_options.GpuProtection}; {context.CaptureBackend}.");
                 // Keep profiling queries out of the experimental protected command path.
                 using var gpuTimestamps = _options.MetricsMode == MetricsMode.DetailedGpu && !requireProtection ? new GpuTimestampCollector(context.Device) : null;
                 GpuOverlayRenderer? gpu = null;
@@ -196,7 +196,7 @@ internal sealed class DuplicationCapture : IDisposable
                             }
                             submittedFrames++;
                             if (frameSequence % 120 == 0)
-                                Logger.Info($"Protected frame sample: frame={frameSequence}; acquireCalls={acquireCalls}; submitted={submittedFrames}; accumulated={accumulatedFrames}; presentCode=0x{present.ResultCode:X8}; {gpu.DescribeRuntimeState()}");
+                                Logger.Debug($"Protected frame: {frameSequence}; submitted={submittedFrames}; {gpu.DescribeRuntimeState()}");
                             if (present.HasStatistics) { timing.PresentCount=present.Statistics.PresentCount; timing.PresentRefreshCount=present.Statistics.PresentRefreshCount; timing.SyncRefreshCount=present.Statistics.SyncRefreshCount; timing.PresentSyncQpcTime=present.Statistics.SyncQPCTime; }
                             if(collectMetrics) LatencyMetrics.Global.RecordSubmitted(timing); lastFrame = DateTimeOffset.Now; frames++;
                             if (csv is not null && timing.FrameId % _options.CsvIntervalFrames == 0) csv.TryWrite(timing, pipelineName, _input.AdapterName, _output.AdapterName, 0, present.ResultCode);

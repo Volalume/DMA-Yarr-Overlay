@@ -71,6 +71,8 @@ internal sealed class SettingsWindow : Form
             ref cornerPreference,
             sizeof(int));
 
+        _state.RegisterSettingsWindow(Handle);
+
         if (Visible && WindowState != FormWindowState.Minimized) _renderTimer.Start();
     }
 
@@ -217,6 +219,7 @@ internal sealed class SettingsWindow : Form
     {
         if (disposing && !_disposed)
         {
+            if (IsHandleCreated) _state.UnregisterSettingsWindow(Handle);
             _disposed = true;
             _renderTimer.Stop();
             _renderTimer.Tick -= RenderFrame;
@@ -434,6 +437,7 @@ internal sealed class SettingsWindow : Form
 
     private void DrawSettingsTab()
     {
+        const float settingsContentHeight = 526f;
         ImGui.Spacing();
         if (ImGui.BeginTable("SettingsColumns", 2, ImGuiTableFlags.SizingStretchProp))
         {
@@ -441,9 +445,9 @@ internal sealed class SettingsWindow : Form
         ImGui.TableSetupColumn("General", ImGuiTableColumnFlags.WidthStretch, 1f);
         ImGui.TableNextRow();
         ImGui.TableNextColumn();
-        DrawAntiCaptureSettings();
+        DrawAntiCaptureSettings(settingsContentHeight);
         ImGui.TableNextColumn();
-        BeginCard("WindowCard", 120, "WINDOW");
+        BeginCard("WindowCard", 130, "WINDOW");
         var topMost = _state.AlwaysOnTop;
         if (ImGui.Checkbox("Always On Top", ref topMost))
         {
@@ -454,7 +458,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("HotkeyCard", 150, "UI HOTKEY");
+        BeginCard("HotkeyCard", 170, "UI HOTKEY");
         ImGui.Text("UI Hotkey");
         ImGui.SameLine();
         var buttonText = _bindingHotkey ? "Press a key..." : $"[ {_state.UiHotkey.DisplayText} ]";
@@ -467,7 +471,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("ShortcutsCard", 170, "SHORTCUTS");
+        BeginCard("ShortcutsCard", 210, "SHORTCUTS");
         ImGui.PushFont(_controller!.MonoFont, 0);
         ImGui.TextWrapped("Space        Start / stop overlay");
         ImGui.TextWrapped("Global +/-   Adjust black threshold by one");
@@ -478,9 +482,9 @@ internal sealed class SettingsWindow : Form
         }
     }
 
-    private void DrawAntiCaptureSettings()
+    private void DrawAntiCaptureSettings(float height)
     {
-        BeginCard("AntiCaptureCard", 200, "ANTI-CAPTURE");
+        BeginCard("AntiCaptureCard", height, "ANTI-CAPTURE");
         var level = _state.ProtectionLevel;
         ImGui.SetNextItemWidth(-1);
         if (ImGui.BeginCombo("##ProtectionLevel", ProtectionLevelNames[(int)level]))
@@ -488,12 +492,8 @@ internal sealed class SettingsWindow : Form
             for (var i = 0; i < ProtectionLevelNames.Length; i++)
             {
                 var candidate = (CaptureProtectionLevel)i;
-                var unavailable = candidate == CaptureProtectionLevel.Kernel;
-                if (ImGui.Selectable(ProtectionLevelNames[i], candidate == level,
-                    unavailable ? ImGuiSelectableFlags.Disabled : ImGuiSelectableFlags.None))
-                    RunUiAction(() => _state.SetProtectionLevel(candidate));
-                if (unavailable && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                    ImGui.SetTooltip("Not implemented.");
+                if (ImGui.Selectable(ProtectionLevelNames[i], candidate == level))
+                    RunProtectionUiAction(() => _state.SetProtectionLevel(candidate));
                 if (candidate == level) ImGui.SetItemDefaultFocus();
             }
             ImGui.EndCombo();
@@ -504,7 +504,15 @@ internal sealed class SettingsWindow : Form
             var appearance = _state.AntiCapture == AntiCaptureMode.Black ? 0 : 1;
             ImGui.SetNextItemWidth(180);
             if (ImGui.Combo("Capture result", ref appearance, "Black\0Exclude\0"))
-                RunUiAction(() => _state.SetAntiCaptureMode(appearance == 0 ? AntiCaptureMode.Black : AntiCaptureMode.Exclude));
+                RunProtectionUiAction(() => _state.SetAntiCaptureMode(appearance == 0 ? AntiCaptureMode.Black : AntiCaptureMode.Exclude));
+        }
+        else if (level == CaptureProtectionLevel.Hardware)
+        {
+            var monitorOnly = _state.HardwareMonitorOnly;
+            //if (ImGui.Checkbox("Monitor Only", ref monitorOnly))
+                //RunProtectionUiAction(() => _state.SetHardwareMonitorOnly(monitorOnly));
+            //if (ImGui.IsItemHovered())
+               // ImGui.SetTooltip("Adds WDA_MONITOR (Black) on top of GPU protection.");
         }
 
         RefreshProtectionVerification();
@@ -515,8 +523,22 @@ internal sealed class SettingsWindow : Form
         ImGui.PopTextWrapPos();
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(_protectionVerification.Detail);
 
+        if (!string.IsNullOrWhiteSpace(_protectionVerification.AffinityLabel))
+        {
+            ImGui.PushTextWrapPos(0);
+            ImGui.TextDisabled(_protectionVerification.AffinityLabel);
+            ImGui.PopTextWrapPos();
+        }
+
+        if (level == CaptureProtectionLevel.Kernel)
+        {
+            var driverLoaded = _state.KernelDriverLoaded;
+            ImGui.TextColored(driverLoaded ? ImGuiTheme.Good : ImGuiTheme.Warning,
+                driverLoaded ? "● Driver is Loaded" : "● Driver is Not Loaded");
+        }
+
         var status = _state.GpuOutputStatus;
-        if (level == CaptureProtectionLevel.Hardware && status.Blocked && ImGui.Button("Retry")) RunUiAction(_state.Start);
+        if (level == CaptureProtectionLevel.Hardware && status.Blocked && ImGui.Button("Retry")) RunProtectionUiAction(_state.Start);
 
         ImGui.EndChild();
     }
@@ -687,6 +709,13 @@ internal sealed class SettingsWindow : Form
         {
             _notification = ex.Message;
         }
+    }
+
+    private void RunProtectionUiAction(Action action)
+    {
+        RunUiAction(action);
+        _nextProtectionVerification = 0;
+        RefreshProtectionVerification();
     }
 
     private static string Format(double? value) => LatencyFormatter.Milliseconds(value);

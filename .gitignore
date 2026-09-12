@@ -3,6 +3,8 @@
 **/bin/
 **/obj/
 publish/
+CaptureDiagnostics/
+**/x64/
 TestResults/
 *.user
 *.suo

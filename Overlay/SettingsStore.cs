@@ -43,6 +43,8 @@ internal sealed class AppSettings
     public bool AlwaysOnTop { get; set; } = true;
     public AntiCaptureMode AntiCapture { get; set; } = AntiCaptureMode.Off;
     public GpuProtectionMode GpuProtection { get; set; } = GpuProtectionMode.Off;
+    public bool HardwareMonitorOnly { get; set; }
+    public CaptureProtectionLevel ProtectionLevel { get; set; } = CaptureProtectionLevel.Off;
     public int UiHotkeyKey { get; set; } = (int)Keys.Insert;
     public uint UiHotkeyModifiers { get; set; }
 }
@@ -86,7 +88,8 @@ internal static class SettingsStore
         {
             SaveTimer.Change(Timeout.Infinite, Timeout.Infinite);
             _pendingJson = null;
-            Write(json);
+            if (Write(json))
+                Logger.Info($"Settings saved immediately: path='{AppPaths.SettingsFile}', protection={settings.ProtectionLevel}, softwareResult={settings.AntiCapture}, gpu={settings.GpuProtection}, monitorOnly={settings.HardwareMonitorOnly}");
         }
     }
 
@@ -103,13 +106,18 @@ internal static class SettingsStore
     private static string Serialize(AppSettings settings) =>
         JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
 
-    private static void Write(string json)
+    private static bool Write(string json)
     {
         try
         {
             AppPaths.EnsureDataDirectory();
             File.WriteAllText(AppPaths.SettingsFile, json);
+            return true;
         }
-        catch (Exception ex) { Logger.Error($"Settings save failed: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logger.Error($"Settings save failed: path='{AppPaths.SettingsFile}', error={ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
     }
 }

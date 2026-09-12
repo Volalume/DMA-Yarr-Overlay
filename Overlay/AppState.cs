@@ -9,7 +9,10 @@ internal sealed class AppState : IDisposable
 {
     private readonly DuplicationCapture _capture = new();
     private readonly OverlayHost _overlayHost = new();
+    private readonly KernelCaptureProtection _kernelProtection = new();
     private readonly AppSettings _settings;
+    private IntPtr _settingsWindowHandle;
+    private string? _lastKernelAffinityLog;
     private int _recoveryQueued;
     private bool _disposed;
 
@@ -17,6 +20,15 @@ internal sealed class AppState : IDisposable
     {
         _settings = SettingsStore.Load();
         if (!Enum.IsDefined(_settings.AntiCapture)) _settings.AntiCapture = AntiCaptureMode.Off;
+        if (!Enum.IsDefined(_settings.ProtectionLevel)) _settings.ProtectionLevel = CaptureProtectionLevel.Off;
+        // Migrate settings written before the unified protection level was persisted.
+        if (_settings.ProtectionLevel == CaptureProtectionLevel.Off)
+        {
+            if (_settings.GpuProtection != GpuProtectionMode.Off)
+                _settings.ProtectionLevel = CaptureProtectionLevel.Hardware;
+            else if (_settings.AntiCapture != AntiCaptureMode.Off)
+                _settings.ProtectionLevel = CaptureProtectionLevel.Software;
+        }
         // Unknown nonzero protection settings stay fail-closed in the capture worker.
         ApplyEffectiveCaptureProtection();
         Monitors = MonitorInfo.Enumerate();
@@ -59,17 +71,15 @@ internal sealed class AppState : IDisposable
     public bool AlwaysOnTop => _settings.AlwaysOnTop;
     public AntiCaptureMode AntiCapture => _settings.AntiCapture;
     public GpuProtectionMode GpuProtection => _settings.GpuProtection;
-    // Derive the unified UI level from existing settings; no migration or downgrade
-    // of an already enabled hardware output path is needed.
-    public CaptureProtectionLevel ProtectionLevel => _settings.GpuProtection != GpuProtectionMode.Off
-        ? CaptureProtectionLevel.Hardware
-        : _settings.AntiCapture != AntiCaptureMode.Off ? CaptureProtectionLevel.Software : CaptureProtectionLevel.Off;
+    public bool HardwareMonitorOnly => _settings.HardwareMonitorOnly;
+    public CaptureProtectionLevel ProtectionLevel => _settings.ProtectionLevel;
     public GpuProtectionStatus GpuOutputStatus => _settings.GpuProtection == GpuProtectionMode.Off
         ? GpuProtectionStatus.Off
         : _capture.ProtectionStatus.Blocked || IsRunning ? _capture.ProtectionStatus
         : new(false, false, "Not started", "Hardware support is checked when you start the overlay.");
     public string OverlayCaptureStatus => _overlayHost.OverlayCaptureStatus;
     public string HudCaptureStatus => _overlayHost.HudCaptureStatus;
+    public bool KernelDriverLoaded => _kernelProtection.DriverLoaded;
     public HotkeyBinding UiHotkey { get; private set; }
     private bool _running;
     public bool IsRunning => _running && !_capture.ProtectionStatus.Blocked;
@@ -159,13 +169,36 @@ internal sealed class AppState : IDisposable
     {
         if (value == _settings.AlwaysOnTop) return; _settings.AlwaysOnTop = value; Save(); StateChanged?.Invoke();
     }
+    public void RegisterSettingsWindow(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero || !NativeMethods.IsWindow(handle)) return;
+        _settingsWindowHandle = handle;
+        if (ProtectionLevel == CaptureProtectionLevel.Kernel)
+            ApplyEffectiveCaptureProtection();
+        StateChanged?.Invoke();
+    }
+    public void UnregisterSettingsWindow(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero || handle != _settingsWindowHandle) return;
+        if (ProtectionLevel == CaptureProtectionLevel.Kernel)
+        {
+            try { _kernelProtection.Disable(); }
+            catch { }
+        }
+        _settingsWindowHandle = IntPtr.Zero;
+        StateChanged?.Invoke();
+    }
     public void SetAntiCaptureMode(AntiCaptureMode value)
     {
         if (!Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(value));
         if (value == _settings.AntiCapture && ProtectionLevel == CaptureProtectionLevel.Software) return;
         var restart = IsRunning;
+        Logger.Info($"Protection change requested: softwareResult={value}; previousLevel={ProtectionLevel}; previousSoftwareResult={_settings.AntiCapture}; running={restart}");
         Stop();
         _settings.AntiCapture = value;
+        _settings.ProtectionLevel = value == AntiCaptureMode.Off
+            ? CaptureProtectionLevel.Off
+            : CaptureProtectionLevel.Software;
         // DWM can retain the capture behavior of an existing layered/
         // DirectComposition surface even though GetWindowDisplayAffinity already
         // reports the new value. Recreate the HWND and its renderer so the new
@@ -174,29 +207,51 @@ internal sealed class AppState : IDisposable
         ApplyEffectiveCaptureProtection();
         Save(immediate: true);
         if (restart) Start();
+        LogProtectionState("software result change completed");
         StateChanged?.Invoke();
     }
     public void SetProtectionLevel(CaptureProtectionLevel value)
     {
         if (!Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(value));
-        if (value == CaptureProtectionLevel.Kernel) throw new NotSupportedException("Kernel Level is not implemented.");
         if (value == ProtectionLevel) return;
         var restart = IsRunning;
+        Logger.Info($"Protection change requested: level={value}; previousLevel={ProtectionLevel}; softwareResult={_settings.AntiCapture}; running={restart}");
         Stop();
+        if (ProtectionLevel == CaptureProtectionLevel.Kernel)
+            _kernelProtection.Disable();
         _capture.ResetProtectionStatus();
+        _settings.ProtectionLevel = value;
         _settings.GpuProtection = value == CaptureProtectionLevel.Hardware ? GpuProtectionMode.HardwareRequired : GpuProtectionMode.Off;
-        // Hardware always uses the Black affinity required by the display-only
-        // swap-chain contract; it must not inherit Software's Black/Exclude choice.
+        // Hardware protection is provided by the protected/display-only swap
+        // chain. Window display affinity is an optional compatibility layer.
         if (value == CaptureProtectionLevel.Off) _settings.AntiCapture = AntiCaptureMode.Off;
         else if (value == CaptureProtectionLevel.Software && _settings.AntiCapture == AntiCaptureMode.Off)
             _settings.AntiCapture = AntiCaptureMode.Exclude;
+        else if (value == CaptureProtectionLevel.Kernel)
+            _settings.AntiCapture = AntiCaptureMode.Off;
         // A new HWND guarantees that a protected DirectComposition target and its
         // display-affinity state cannot leak across protection-level transitions.
         if (!restart || value != CaptureProtectionLevel.Hardware)
             _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
+        ApplyEffectiveCaptureProtection(requireKernel: value == CaptureProtectionLevel.Kernel);
+        Save(immediate: true);
+        if (restart) Start();
+        LogProtectionState("protection level change completed");
+        StateChanged?.Invoke();
+    }
+    public void SetHardwareMonitorOnly(bool value)
+    {
+        if (value == _settings.HardwareMonitorOnly) return;
+        var restart = IsRunning;
+        Logger.Info($"Hardware Monitor Only change requested: value={value}; running={restart}");
+        Stop();
+        _settings.HardwareMonitorOnly = value;
+        if (ProtectionLevel == CaptureProtectionLevel.Hardware)
+            _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
         ApplyEffectiveCaptureProtection();
         Save(immediate: true);
         if (restart) Start();
+        LogProtectionState("hardware monitor-only change completed");
         StateChanged?.Invoke();
     }
     public void SetUiHotkey(HotkeyBinding value)
@@ -229,14 +284,15 @@ internal sealed class AppState : IDisposable
             _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
         Logger.Info($"Starting: capture={CurrentInputMonitor.Identity}; output={CurrentOutputMonitor.Identity}; different={CurrentInputMonitor.Identity != CurrentOutputMonitor.Identity}; captureSize={CurrentInputMonitor.Bounds.Size}; outputSize={CurrentOutputMonitor.Bounds.Size}; scaling={ScalingMode}");
         _overlayHost.ShowOverlay();
-        ApplyEffectiveCaptureProtection();
+        try { ApplyEffectiveCaptureProtection(requireKernel: ProtectionLevel == CaptureProtectionLevel.Kernel); }
+        catch { _overlayHost.HideOverlay(); throw; }
         _capture.Start(CurrentInputMonitor, CurrentOutputMonitor, ChromaThreshold, Sharpness / 100f, ScalingMode, _overlayHost.OverlayHandle, CaptureOptions.From(_settings));
         _running = true; _overlayHost.SetHudMode(_settings.LatencyTestMode ? PerformanceHudMode.Detailed : _settings.PerformanceHud, IsRunning);
         if (_capture.ProtectionStatus.Blocked) HandleProtectedOutputBlocked();
         StateChanged?.Invoke();
     }
     public void Stop() { if (!_running) return; _capture.Stop(); _overlayHost.ClearFrame(); _overlayHost.HideOverlay(); _overlayHost.SetHudMode(_settings.PerformanceHud, false); _running = false; StateChanged?.Invoke(); }
-    public void Dispose() { if (_disposed) return; _disposed = true; _capture.FrameReady -= HandleFrameReady; _capture.RecreateRequested -= HandleCaptureRecreate; _capture.ProtectedOutputBlocked -= HandleProtectedOutputBlocked; Stop(); _capture.Dispose(); _overlayHost.Dispose(); SettingsStore.Flush(); }
+    public void Dispose() { if (_disposed) return; _disposed = true; _capture.FrameReady -= HandleFrameReady; _capture.RecreateRequested -= HandleCaptureRecreate; _capture.ProtectedOutputBlocked -= HandleProtectedOutputBlocked; Stop(); _kernelProtection.Dispose(); _capture.Dispose(); _overlayHost.Dispose(); SettingsStore.Flush(); }
 
     private void HandleFrameReady(FrameEnvelope frame) => _overlayHost.SetFrame(frame);
     private void HandleProtectedOutputBlocked() => _overlayHost.HideBlockedOutput(() => _capture.ProtectionStatus.Blocked);
@@ -255,17 +311,43 @@ internal sealed class AppState : IDisposable
     private AntiCaptureMode EffectiveOverlayAntiCaptureMode => ProtectionLevel switch
     {
         CaptureProtectionLevel.Software => _settings.AntiCapture,
-        CaptureProtectionLevel.Hardware => AntiCaptureMode.Black,
+        CaptureProtectionLevel.Hardware when _settings.HardwareMonitorOnly => AntiCaptureMode.Black,
         _ => AntiCaptureMode.Off
     };
     private AntiCaptureMode EffectiveHudAntiCaptureMode => ProtectionLevel switch
     {
         CaptureProtectionLevel.Software => _settings.AntiCapture,
-        CaptureProtectionLevel.Hardware => AntiCaptureMode.Black,
+        CaptureProtectionLevel.Hardware when _settings.HardwareMonitorOnly => AntiCaptureMode.Black,
         _ => AntiCaptureMode.Off
     };
-    private void ApplyEffectiveCaptureProtection() =>
+    private void ApplyEffectiveCaptureProtection(bool requireKernel = false)
+    {
         _overlayHost.SetAntiCaptureModes(EffectiveOverlayAntiCaptureMode, EffectiveHudAntiCaptureMode);
+        if (ProtectionLevel != CaptureProtectionLevel.Kernel) return;
+
+        try
+        {
+            _kernelProtection.Enable(_overlayHost.OverlayHandle, _overlayHost.HudHandle, _settingsWindowHandle);
+        }
+        catch (Exception ex)
+        {
+            _kernelProtection.MarkFailure(ex);
+            if (requireKernel)
+                throw new InvalidOperationException($"Kernel protection failed: {ex.Message}", ex);
+        }
+    }
+    private void LogProtectionState(string reason)
+    {
+        try
+        {
+            var verification = InspectCaptureProtection();
+            Logger.Info($"Protection state: reason='{reason}'; level={ProtectionLevel}; softwareResult={_settings.AntiCapture}; verified={verification.Verified}; failed={verification.Failed}; label='{verification.Label}'; {verification.AffinityLabel}");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Protection state inspection failed after '{reason}': {ex.GetType().Name}: {ex.Message}");
+        }
+    }
     public CaptureProtectionVerification InspectCaptureProtection()
     {
         var windows = _overlayHost.InspectAntiCapture();
@@ -274,18 +356,50 @@ internal sealed class AppState : IDisposable
         var actual = $"Overlay {windows.Overlay.ActualLabel} / HUD {windows.Hud.ActualLabel}";
         var offModesMatch = windows.Overlay.Requested == AntiCaptureMode.Off && windows.Hud.Requested == AntiCaptureMode.Off;
         var softwareModesMatch = windows.Overlay.Requested == _settings.AntiCapture && windows.Hud.Requested == _settings.AntiCapture;
-        var hardwareModesMatch = windows.Overlay.Requested == AntiCaptureMode.Black && windows.Hud.Requested == AntiCaptureMode.Black;
+        var expectedHardwareAffinity = _settings.HardwareMonitorOnly ? AntiCaptureMode.Black : AntiCaptureMode.Off;
+        var hardwareModesMatch = windows.Overlay.Requested == expectedHardwareAffinity && windows.Hud.Requested == expectedHardwareAffinity;
         var requested = $"requested Overlay {windows.Overlay.Requested} / HUD {windows.Hud.Requested}";
+        var settingsAffinity = ReadDisplayAffinity(_settingsWindowHandle);
+        var affinityLabel = $"Affinity: Overlay {windows.Overlay.ActualLabel} | HUD {windows.Hud.ActualLabel} | Settings {settingsAffinity.Label}";
+        if (ProtectionLevel == CaptureProtectionLevel.Kernel && !string.Equals(_lastKernelAffinityLog, affinityLabel, StringComparison.Ordinal))
+        {
+            _lastKernelAffinityLog = affinityLabel;
+            Logger.Info($"Kernel Anti-Capture verification: {affinityLabel}");
+        }
+        var kernelAffinityIsNone = windows.Overlay.Verified && windows.Hud.Verified && settingsAffinity.Success &&
+                                   windows.Overlay.ActualAffinity == NativeMethods.WdaNone &&
+                                   windows.Hud.ActualAffinity == NativeMethods.WdaNone &&
+                                   settingsAffinity.Value == NativeMethods.WdaNone;
         return ProtectionLevel switch
         {
             CaptureProtectionLevel.Off => new(windowVerified && offModesMatch, !windowVerified || !offModesMatch,
-                $"OFF · {actual}", $"{requested}; {windows.Detail}"),
+                $"OFF · {actual}", $"{requested}; {windows.Detail}", affinityLabel),
             CaptureProtectionLevel.Software => new(windowVerified && softwareModesMatch, !windowVerified || !softwareModesMatch,
-                $"SOFTWARE {_settings.AntiCapture.ToString().ToUpperInvariant()} · {actual}", $"{requested}; {windows.Detail}"),
+                $"SOFTWARE {_settings.AntiCapture.ToString().ToUpperInvariant()} · {actual}", $"{requested}; {windows.Detail}", affinityLabel),
             CaptureProtectionLevel.Hardware => new(windowVerified && hardwareModesMatch && gpu.Active, gpu.Blocked || !windowVerified || !hardwareModesMatch,
-                $"HARDWARE {(gpu.Active ? "ACTIVE" : gpu.Summary.ToUpperInvariant())} · {actual}", $"{gpu.Detail} | {requested}; {windows.Detail}"),
-            _ => new(false, true, "KERNEL · NOT IMPLEMENTED", "Kernel Level is not implemented.")
+                $"HARDWARE {(gpu.Active ? "ACTIVE" : gpu.Summary.ToUpperInvariant())} · {actual}", $"GPU protected/display-only; Monitor Only={_settings.HardwareMonitorOnly}. {gpu.Detail} | {requested}; {windows.Detail}", affinityLabel),
+            CaptureProtectionLevel.Kernel => new(_kernelProtection.State.Active && kernelAffinityIsNone,
+                _kernelProtection.State.Failed || !kernelAffinityIsNone,
+                $"KERNEL · {_kernelProtection.State.Summary}",
+                $"{_kernelProtection.State.Detail} {affinityLabel}",
+                affinityLabel),
+            _ => new(false, true, "UNKNOWN PROTECTION LEVEL", "The saved protection level is invalid.")
         };
+    }
+    private static DisplayAffinityReading ReadDisplayAffinity(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero || !NativeMethods.IsWindow(handle))
+            return new(false, 0, "UNAVAILABLE");
+        if (!NativeMethods.GetWindowDisplayAffinity(handle, out var value))
+            return new(false, 0, $"ERROR ({System.Runtime.InteropServices.Marshal.GetLastWin32Error()})");
+        var label = value switch
+        {
+            NativeMethods.WdaNone => "OFF (0x0)",
+            NativeMethods.WdaMonitor => "BLACK (0x1)",
+            NativeMethods.WdaExcludeFromCapture => "EXCLUDE (0x11)",
+            _ => $"UNKNOWN (0x{value:X})"
+        };
+        return new(true, value, label);
     }
     private void UpdateOutputMonitor() => _overlayHost.SetMonitor(CurrentOutputMonitor);
     private int Resolve(DisplaySelection? selected, bool capture)
@@ -298,4 +412,5 @@ internal sealed class AppState : IDisposable
     private void Save(bool immediate = false) { _settings.CaptureDisplay = DisplaySelection.From(CurrentInputMonitor); _settings.OutputDisplay = DisplaySelection.From(CurrentOutputMonitor); _settings.ChromaThreshold = ChromaThreshold; _settings.Sharpness = Sharpness; _settings.ScalingMode = ScalingMode; if (immediate) SettingsStore.SaveNow(_settings); else SettingsStore.Save(_settings); }
 }
 
-internal readonly record struct CaptureProtectionVerification(bool Verified, bool Failed, string Label, string Detail);
+internal readonly record struct CaptureProtectionVerification(bool Verified, bool Failed, string Label, string Detail, string? AffinityLabel = null);
+internal readonly record struct DisplayAffinityReading(bool Success, uint Value, string Label);

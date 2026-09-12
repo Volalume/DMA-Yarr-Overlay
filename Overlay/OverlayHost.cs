@@ -83,6 +83,16 @@ internal sealed class OverlayHost : IDisposable
         InvokeOnWindow(() => _window!.HideOverlay());
     }
 
+    public IntPtr HudHandle
+    {
+        get
+        {
+            var handle = IntPtr.Zero;
+            InvokeOnWindow(() => handle = _hud!.Handle);
+            return handle;
+        }
+    }
+
     public void ResetOutputWindow(MonitorInfo monitor, AntiCaptureMode mode)
     {
         InvokeOnWindow(() =>

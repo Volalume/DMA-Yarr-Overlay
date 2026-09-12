@@ -58,7 +58,7 @@ internal sealed class WindowCaptureProtection
             return;
         }
         _status = excludeUnavailable ? "Black (Exclude requires Windows 10 2004+)" : _mode.ToString();
-        Logger.Info($"Anti-Capture {_window.GetType().Name}: {_status}, affinity=0x{actual:X}");
+        Logger.Debug($"Anti-Capture {_window.GetType().Name}: {_status}, affinity=0x{actual:X}");
     }
 
     private static uint GetExpectedAffinity(AntiCaptureMode mode, out bool excludeUnavailable)
