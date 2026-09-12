@@ -151,3 +151,9 @@ The published executable is written to `Overlay/bin/Release/single-file/`.
 ![YarrOverlay output close-up](./imgs/overlay-output-close.png)
 
 ![YarrOverlay Overlay Output](./imgs/2.png)
+
+## Kernel-level protection warning
+
+Do not use **Kernel Level** capture protection unless you have sufficient kernel-development knowledge. Improper use can be detected by anti-cheat software and may trigger a ban. **Hardware Level protection is sufficient for normal use.**
+
+The kernel protection interface is based on the [NoScreen kernel project](https://github.com/KANKOSHEV/NoScreen/tree/main/kernel). Credit to the original author.
