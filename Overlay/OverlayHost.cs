@@ -14,14 +14,19 @@ internal sealed class OverlayHost : IDisposable
     private WindowCaptureProtection? _overlayProtection;
     private WindowCaptureProtection? _hudProtection;
     private ApplicationContext? _context;
+    private string _appDisplayName = "Overlay";
+    private string _windowTitle = "Overlay";
+    private string _iconPath = "";
     private bool _disposed;
+    private readonly string _windowClassName;
 
-    public OverlayHost()
+    public OverlayHost(string windowClassName)
     {
+        _windowClassName = CustomWindowClassRegistry.EnsureRegistered(windowClassName);
         _thread = new Thread(ThreadMain)
         {
             IsBackground = true,
-            Name = "YarrOverlayWindow",
+            Name = "OverlayWindow",
             Priority = ThreadPriority.AboveNormal
         };
         _thread.SetApartmentState(ApartmentState.STA);
@@ -63,6 +68,18 @@ internal sealed class OverlayHost : IDisposable
         return new WindowCapturePair(overlay, hud);
     }
 
+    public void SetBranding(string appDisplayName, string windowTitle, string iconPath)
+    {
+        _appDisplayName = appDisplayName;
+        _windowTitle = windowTitle;
+        _iconPath = iconPath;
+        InvokeOnWindow(() =>
+        {
+            _window!.ApplyBranding(_windowTitle, _iconPath);
+            _hud!.ApplyBranding(_appDisplayName, _windowTitle, _iconPath);
+        });
+    }
+
     public IntPtr OverlayHandle
     {
         get
@@ -99,7 +116,8 @@ internal sealed class OverlayHost : IDisposable
         {
             // Discard any previously displayed CPU DIB before enabling GPU protection.
             _window!.Dispose();
-            _window = new OverlayWindow();
+            _window = new OverlayWindow(_windowClassName);
+            _window.ApplyBranding(_windowTitle, _iconPath);
             _overlayProtection = new WindowCaptureProtection(_window);
             _overlayProtection.SetMode(mode);
             _ = _window.Handle;
@@ -174,8 +192,10 @@ internal sealed class OverlayHost : IDisposable
         Application.SetCompatibleTextRenderingDefault(false);
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
 
-        _window = new OverlayWindow();
-        _hud = new PerformanceHudWindow();
+        _window = new OverlayWindow(_windowClassName);
+        _hud = new PerformanceHudWindow(_windowClassName);
+        _window.ApplyBranding(_windowTitle, _iconPath);
+        _hud.ApplyBranding(_appDisplayName, _windowTitle, _iconPath);
         _overlayProtection = new WindowCaptureProtection(_window);
         _hudProtection = new WindowCaptureProtection(_hud);
         _ = _window.Handle;

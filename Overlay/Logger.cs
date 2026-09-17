@@ -12,7 +12,7 @@ internal static class Logger
     {
         var line = $"{DateTimeOffset.Now:O} [DEBUG] {message}";
         System.Diagnostics.Debug.WriteLine(line);
-        if (string.Equals(Environment.GetEnvironmentVariable("YARR_VERBOSE_LOG"), "1", StringComparison.Ordinal))
+        if (string.Equals(Environment.GetEnvironmentVariable("OVERLAY_VERBOSE_LOG"), "1", StringComparison.Ordinal))
             Write("DEBUG", message);
     }
     private static void Write(string level, string message)

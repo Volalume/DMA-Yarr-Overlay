@@ -8,6 +8,8 @@ namespace Overlay;
 
 internal sealed class OverlayWindow : Form
 {
+    private Icon? _customIcon;
+    private readonly string _windowClassName;
     private readonly object _frameSync = new();
     private FrameEnvelope? _currentFrame;
     private MonitorInfo? _monitor;
@@ -16,8 +18,9 @@ internal sealed class OverlayWindow : Form
     private int _renderedVersion;
     private IntPtr _legacyMemoryDc;
 
-    public OverlayWindow()
+    public OverlayWindow(string windowClassName)
     {
+        _windowClassName = windowClassName;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
@@ -29,6 +32,7 @@ internal sealed class OverlayWindow : Form
         get
         {
             var cp = base.CreateParams;
+            cp.ClassName = _windowClassName;
             cp.ExStyle |= NativeMethods.WsExLayered
                 | NativeMethods.WsExTransparent
                 | NativeMethods.WsExToolWindow
@@ -56,6 +60,14 @@ internal sealed class OverlayWindow : Form
                 monitor.Bounds.Height,
                 NativeMethods.SwpNoActivate);
         }
+    }
+
+    public void ApplyBranding(string windowTitle, string iconPath)
+    {
+        Text = windowTitle;
+        _customIcon?.Dispose();
+        _customIcon = BrandingIcon.TryLoad(iconPath);
+        Icon = _customIcon;
     }
 
     public void ShowOverlay()
@@ -127,6 +139,8 @@ internal sealed class OverlayWindow : Form
     {
         if (disposing)
         {
+            _customIcon?.Dispose();
+            _customIcon = null;
             ClearFrame();
             if (_legacyMemoryDc != IntPtr.Zero) { NativeMethods.DeleteDC(_legacyMemoryDc); _legacyMemoryDc = IntPtr.Zero; }
         }

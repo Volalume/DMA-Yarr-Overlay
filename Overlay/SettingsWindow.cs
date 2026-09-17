@@ -27,12 +27,15 @@ internal sealed class SettingsWindow : Form
     private IntPtr _previousForegroundWindow;
     private bool _changingVisibility;
     private bool _disposed;
+    private Icon? _customIcon;
+    private readonly string _windowClassName;
     private static readonly string[] ProtectionLevelNames = { "Off", "Software Level", "Hardware Level", "Kernel Level" };
 
     public SettingsWindow(AppState state)
     {
         _state = state;
-        Text = "YarrOverlay Control";
+        _windowClassName = state.ActiveWindowClassName;
+        ApplyBranding();
         ClientSize = new Size(ControlWidth, ControlHeight);
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.None;
@@ -46,6 +49,16 @@ internal sealed class SettingsWindow : Form
 
         _renderTimer = new System.Windows.Forms.Timer { Interval = 16 };
         _renderTimer.Tick += RenderFrame;
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ClassName = _windowClassName;
+            return cp;
+        }
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -224,6 +237,8 @@ internal sealed class SettingsWindow : Form
             _renderTimer.Stop();
             _renderTimer.Tick -= RenderFrame;
             _renderTimer.Dispose();
+            _customIcon?.Dispose();
+            _customIcon = null;
         }
 
         base.Dispose(disposing);
@@ -248,7 +263,7 @@ internal sealed class SettingsWindow : Form
             | ImGuiWindowFlags.NoSavedSettings;
 
         ImGui.PushFont(_controller.BodyFont, 0);
-        ImGui.Begin("YarrOverlay##Root", flags);
+        ImGui.Begin("Overlay##Root", flags);
         DrawHeader();
 
         if (ImGui.BeginTabBar("MainTabs", ImGuiTabBarFlags.FittingPolicyShrink | ImGuiTabBarFlags.DrawSelectedOverline))
@@ -437,7 +452,9 @@ internal sealed class SettingsWindow : Form
 
     private void DrawSettingsTab()
     {
-        const float settingsContentHeight = 526f;
+        // Leave a dedicated footer lane below the tab instead of allowing this
+        // table to push the persistent status text outside the client area.
+        const float settingsContentHeight = 460f;
         ImGui.Spacing();
         if (ImGui.BeginTable("SettingsColumns", 2, ImGuiTableFlags.SizingStretchProp))
         {
@@ -447,7 +464,7 @@ internal sealed class SettingsWindow : Form
         ImGui.TableNextColumn();
         DrawAntiCaptureSettings(settingsContentHeight);
         ImGui.TableNextColumn();
-        BeginCard("WindowCard", 130, "WINDOW");
+        BeginCard("WindowCard", 120, "WINDOW");
         var topMost = _state.AlwaysOnTop;
         if (ImGui.Checkbox("Always On Top", ref topMost))
         {
@@ -458,7 +475,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("HotkeyCard", 170, "UI HOTKEY");
+        BeginCard("HotkeyCard", 120, "UI HOTKEY");
         ImGui.Text("UI Hotkey");
         ImGui.SameLine();
         var buttonText = _bindingHotkey ? "Press a key..." : $"[ {_state.UiHotkey.DisplayText} ]";
@@ -471,7 +488,7 @@ internal sealed class SettingsWindow : Form
         ImGui.EndChild();
 
         ImGui.Spacing();
-        BeginCard("ShortcutsCard", 210, "SHORTCUTS");
+        BeginCard("ShortcutsCard", 150, "SHORTCUTS");
         ImGui.PushFont(_controller!.MonoFont, 0);
         ImGui.TextWrapped("Space        Start / stop overlay");
         ImGui.TextWrapped("Global +/-   Adjust black threshold by one");
@@ -484,7 +501,8 @@ internal sealed class SettingsWindow : Form
 
     private void DrawAntiCaptureSettings(float height)
     {
-        BeginCard("AntiCaptureCard", height, "ANTI-CAPTURE");
+        BeginCard("AntiCaptureCard", height, "PROTECTION");
+        ImGui.SeparatorText("ANTI-CAPTURE");
         var level = _state.ProtectionLevel;
         ImGui.SetNextItemWidth(-1);
         if (ImGui.BeginCombo("##ProtectionLevel", ProtectionLevelNames[(int)level]))
@@ -506,15 +524,6 @@ internal sealed class SettingsWindow : Form
             if (ImGui.Combo("Capture result", ref appearance, "Black\0Exclude\0"))
                 RunProtectionUiAction(() => _state.SetAntiCaptureMode(appearance == 0 ? AntiCaptureMode.Black : AntiCaptureMode.Exclude));
         }
-        else if (level == CaptureProtectionLevel.Hardware)
-        {
-            var monitorOnly = _state.HardwareMonitorOnly;
-            //if (ImGui.Checkbox("Monitor Only", ref monitorOnly))
-                //RunProtectionUiAction(() => _state.SetHardwareMonitorOnly(monitorOnly));
-            //if (ImGui.IsItemHovered())
-               // ImGui.SetTooltip("Adds WDA_MONITOR (Black) on top of GPU protection.");
-        }
-
         RefreshProtectionVerification();
         var verificationColor = _protectionVerification.Failed ? ImGuiTheme.Warning
             : _protectionVerification.Verified ? ImGuiTheme.Good : ImGuiTheme.Accent;
@@ -539,6 +548,14 @@ internal sealed class SettingsWindow : Form
 
         var status = _state.GpuOutputStatus;
         if (level == CaptureProtectionLevel.Hardware && status.Blocked && ImGui.Button("Retry")) RunProtectionUiAction(_state.Start);
+
+        ImGui.Spacing();
+        ImGui.SeparatorText("APPLICATION DATA");
+        ImGui.TextDisabled($"Name: {_state.AppDisplayName}");
+        ImGui.TextDisabled($"Title: {_state.WindowTitle}");
+        ImGui.TextDisabled($"Class base: {_state.WindowClassName}{(_state.WindowClassName == _state.ActiveWindowClassName ? "" : " (restart pending)")}");
+        ImGui.TextDisabled($"Icon: {(string.IsNullOrWhiteSpace(_state.IconPath) ? "Default" : System.IO.Path.GetFileName(_state.IconPath))}");
+        if (ImGui.Button("Edit Data", new Vector2(132, 34))) BeginInvoke(new Action(EditBranding));
 
         ImGui.EndChild();
     }
@@ -581,8 +598,11 @@ internal sealed class SettingsWindow : Form
 
     private void DrawFooter()
     {
-        var height = ImGui.GetFrameHeightWithSpacing() + 2;
-        ImGui.SetCursorPosY(Math.Max(ImGui.GetCursorPosY(), ImGui.GetWindowHeight() - height - 10));
+        // Keep enough room for both the optional notification and the persistent
+        // status line. Reserving only one line pushed the status below the window.
+        const int reservedLines = 2;
+        var height = ImGui.GetTextLineHeightWithSpacing() * reservedLines + ImGui.GetStyle().ItemSpacing.Y + 2;
+        ImGui.SetCursorPosY(ImGui.GetWindowHeight() - height - 10);
         ImGui.Separator();
         if (!string.IsNullOrWhiteSpace(_notification)) ImGui.TextDisabled(_notification);
         ImGui.TextDisabled(_state.StatusText);
@@ -709,6 +729,49 @@ internal sealed class SettingsWindow : Form
         {
             _notification = ex.Message;
         }
+    }
+
+    private void EditBranding()
+    {
+        using var dialog = new BrandingDialog(_state.AppDisplayName, _state.WindowTitle, _state.WindowClassName, _state.IconPath);
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        var restartRequired = !string.Equals(dialog.WindowClassName.Trim(), _state.ActiveWindowClassName, StringComparison.Ordinal);
+        try
+        {
+            _state.SetBranding(dialog.AppDisplayName, dialog.WindowTitle, dialog.WindowClassName, dialog.IconPath);
+            ApplyBranding();
+            _notification = restartRequired ? "Window class saved; restart pending." : "Branding updated.";
+        }
+        catch (Exception ex)
+        {
+            _notification = ex.Message;
+            return;
+        }
+        if (restartRequired)
+        {
+            using var restart = new RestartRequiredDialog(_state.WindowClassName);
+            if (restart.ShowDialog(this) == DialogResult.OK) RestartApplication();
+        }
+    }
+
+    private void ApplyBranding()
+    {
+        Text = _state.WindowTitle;
+        _customIcon?.Dispose();
+        _customIcon = BrandingIcon.TryLoad(_state.IconPath);
+        Icon = _customIcon;
+    }
+
+    private void RestartApplication()
+    {
+        var executable = Environment.ProcessPath ?? throw new InvalidOperationException("Current executable path is unavailable.");
+        var start = new ProcessStartInfo(executable) { UseShellExecute = true };
+        start.ArgumentList.Add("--restart-wait");
+        start.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (Environment.GetCommandLineArgs().Any(a => string.Equals(a, "--autostart", StringComparison.OrdinalIgnoreCase)))
+            start.ArgumentList.Add("--autostart");
+        Process.Start(start);
+        BeginInvoke(new Action(Close));
     }
 
     private void RunProtectionUiAction(Action action)

@@ -53,7 +53,7 @@ internal static class NativeMethods
     public const int BiRgb = 0;
     public const int EnumCurrentSettings = -1;
     public const uint MonitorDefaultToNearest = 2;
-    public static readonly int WmShowSettings = RegisterWindowMessage("YarrOverlay.ShowSettings.v1");
+    public static readonly int WmShowSettings = RegisterWindowMessage("Overlay.ShowSettings.v1");
 
     [DllImport("user32.dll")]
     public static extern IntPtr MonitorFromPoint(Point pt, uint flags);

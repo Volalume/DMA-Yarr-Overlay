@@ -15,7 +15,7 @@ internal sealed class MarkerForm : Form
     private long _frame;
     public MarkerForm()
     {
-        Text="YarrOverlay Latency Marker — place on Parsec host"; ClientSize=new Size(900,300); DoubleBuffered=true; TopMost=true;
+        Text="Overlay Latency Marker — place on Parsec host"; ClientSize=new Size(900,300); DoubleBuffered=true; TopMost=true;
         _timer.Tick+=(_,_)=>{_frame++;Invalidate();}; _timer.Start();
     }
     protected override void OnPaint(PaintEventArgs e)

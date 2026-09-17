@@ -9,7 +9,10 @@ namespace Overlay;
 internal sealed class PerformanceHudWindow : Form
 {
     private const double BasicDeadbandMs = 1.0;
+    private const string ProductDisplayName = "YarrOverlay";
     private const string WaitingText = "YarrOverlay | Waiting for starting...";
+    private Icon? _customIcon;
+    private readonly string _windowClassName;
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 250 };
     private readonly Font _font = new("Consolas", 10.5f, FontStyle.Bold, GraphicsUnit.Point);
     private readonly Font _totalFont = new("Consolas", 14f, FontStyle.Bold, GraphicsUnit.Point);
@@ -17,8 +20,9 @@ internal sealed class PerformanceHudWindow : Form
     private PerformanceHudMode _mode;
     private bool _running;
     private double _displayedBasicLatency = double.NaN;
-    public PerformanceHudWindow()
+    public PerformanceHudWindow(string windowClassName)
     {
+        _windowClassName = windowClassName;
         FormBorderStyle=FormBorderStyle.None; ShowInTaskbar=false; TopMost=true; StartPosition=FormStartPosition.Manual;
         BackColor=Color.FromArgb(13,16,22); ForeColor=Color.White; Opacity=.94; ClientSize=new Size(510,190);
         DoubleBuffered = true;
@@ -27,8 +31,16 @@ internal sealed class PerformanceHudWindow : Form
         _timer.Tick += (_,_) => { if (_running && _mode != PerformanceHudMode.Off) Invalidate(); };
         _timer.Start();
     }
-    protected override CreateParams CreateParams { get { var cp=base.CreateParams; cp.ExStyle|=NativeMethods.WsExTransparent|NativeMethods.WsExToolWindow|NativeMethods.WsExNoActivate; return cp; } }
+    protected override CreateParams CreateParams { get { var cp=base.CreateParams; cp.ClassName=_windowClassName; cp.ExStyle|=NativeMethods.WsExTransparent|NativeMethods.WsExToolWindow|NativeMethods.WsExNoActivate; return cp; } }
     protected override bool ShowWithoutActivation => true;
+    public void ApplyBranding(string appDisplayName, string windowTitle, string iconPath)
+    {
+        Text = windowTitle;
+        _customIcon?.Dispose();
+        _customIcon = BrandingIcon.TryLoad(iconPath);
+        Icon = _customIcon;
+        Invalidate();
+    }
     public void SetMonitor(MonitorInfo monitor) { _monitor=monitor; Location=new Point(monitor.Bounds.X+16,monitor.Bounds.Y+16); }
     public void SetMode(PerformanceHudMode mode, bool running)
     {
@@ -44,7 +56,7 @@ internal sealed class PerformanceHudWindow : Form
         else if(mode==PerformanceHudMode.Off) Hide();
         else
         {
-            if (mode == PerformanceHudMode.Basic) SetBasicHudSize("YarrOverlay | 9999 ms");
+            if (mode == PerformanceHudMode.Basic) SetBasicHudSize($"{ProductDisplayName} | 9999 ms");
             else ClientSize=new Size(510,190);
             ApplyRoundedShape(mode == PerformanceHudMode.Basic ? 12 : 10);
             ShowHud();
@@ -65,16 +77,16 @@ internal sealed class PerformanceHudWindow : Form
         var p=LatencyMetrics.Global.Snapshot(); var w=p.TenSeconds; var y=10f;
         if(_mode==PerformanceHudMode.Basic)
         {
-            DrawBasicBox(e.Graphics, $"YarrOverlay | {LatencyFormatter.Milliseconds(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms");
+            DrawBasicBox(e.Graphics, $"{ProductDisplayName} | {LatencyFormatter.Milliseconds(PresentBasicLatency(p.TotalAppLatencyEstimateMs))} ms");
             return;
         }
         void Line(string s){e.Graphics.DrawString(s,_font,Brushes.White,10,y);y+=20;}
-        Line($"YarrOverlay | submit {w.SubmitFps:F1} fps | queue {p.QueueLength}/{p.MaxQueueLength}");
+        Line($"{ProductDisplayName} | submit {w.SubmitFps:F1} fps | queue {p.QueueLength}/{p.MaxQueueLength}");
         e.Graphics.DrawString($"TOTAL APP LATENCY  {LatencyFormatter.Milliseconds(p.TotalAppLatencyEstimateMs)} ms  (estimate)",_totalFont,Brushes.LightGreen,10,y);y+=30;
         Line($"software submit  {LatencyFormatter.Milliseconds(w.Pipeline.Current)} cur  {LatencyFormatter.Milliseconds(w.Pipeline.Average)} avg  {LatencyFormatter.Milliseconds(w.Pipeline.P95)} p95 ms");
         if(_mode==PerformanceHudMode.Detailed){Line($"age {LatencyFormatter.Milliseconds(w.FrameAge.Average)} interval {LatencyFormatter.Milliseconds(w.FrameInterval.Average)} acquire {LatencyFormatter.Milliseconds(w.AcquireWait.Average)} map {LatencyFormatter.Milliseconds(w.MapWait.Average)}");Line($"CPU copy {LatencyFormatter.Milliseconds(w.CpuCopy.Average)} UI {LatencyFormatter.Milliseconds(w.UiQueue.Average)} GPU copy/shader/total {LatencyFormatter.Milliseconds(w.GpuCopy.Average)}/{LatencyFormatter.Milliseconds(w.GpuShader.Average)}/{LatencyFormatter.Milliseconds(w.GpuTotal.Average)}");Line($"captured {p.CapturedFrames} submitted {p.SubmittedFrames} dropped {p.DroppedFrames} replaced {p.ReplacedFrames}");Line($"accumulated {p.AccumulatedFrames} max {p.MaxAccumulatedFrames} DXGI errors {p.DxgiErrors}");}
     }
-    protected override void Dispose(bool disposing){if(disposing){_timer.Dispose();_font.Dispose();_totalFont.Dispose();}base.Dispose(disposing);}
+    protected override void Dispose(bool disposing){if(disposing){_timer.Dispose();_font.Dispose();_totalFont.Dispose();_customIcon?.Dispose();}base.Dispose(disposing);}
     private double PresentBasicLatency(double raw)
     {
         if (double.IsNaN(raw) || double.IsInfinity(raw)) return raw;

@@ -1,7 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <AssemblyName>YarrOverlay</AssemblyName>
+    <AssemblyName>Overlay</AssemblyName>
+    <Product>Overlay</Product>
+    <AssemblyTitle>Overlay</AssemblyTitle>
+    <Description>Overlay</Description>
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>

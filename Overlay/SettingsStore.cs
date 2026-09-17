@@ -41,9 +41,12 @@ internal sealed class AppSettings
     public int CsvIntervalFrames { get; set; } = 1;
     public bool LatencyTestMode { get; set; }
     public bool AlwaysOnTop { get; set; } = true;
+    public string AppDisplayName { get; set; } = "Overlay";
+    public string WindowTitle { get; set; } = "Overlay";
+    public string WindowClassName { get; set; } = "Overlay.Window";
+    public string IconPath { get; set; } = "";
     public AntiCaptureMode AntiCapture { get; set; } = AntiCaptureMode.Off;
     public GpuProtectionMode GpuProtection { get; set; } = GpuProtectionMode.Off;
-    public bool HardwareMonitorOnly { get; set; }
     public CaptureProtectionLevel ProtectionLevel { get; set; } = CaptureProtectionLevel.Off;
     public int UiHotkeyKey { get; set; } = (int)Keys.Insert;
     public uint UiHotkeyModifiers { get; set; }
@@ -56,7 +59,9 @@ internal static class SettingsStore
 
     public static AppSettings Load()
     {
-        var path = File.Exists(AppPaths.SettingsFile) ? AppPaths.SettingsFile : AppPaths.LegacySettingsFile;
+        var path = File.Exists(AppPaths.SettingsFile) ? AppPaths.SettingsFile
+            : File.Exists(AppPaths.PreviousSettingsFile) ? AppPaths.PreviousSettingsFile
+            : AppPaths.LegacySettingsFile;
         if (!File.Exists(path)) return new AppSettings();
         try
         {
@@ -89,7 +94,7 @@ internal static class SettingsStore
             SaveTimer.Change(Timeout.Infinite, Timeout.Infinite);
             _pendingJson = null;
             if (Write(json))
-                Logger.Info($"Settings saved immediately: path='{AppPaths.SettingsFile}', protection={settings.ProtectionLevel}, softwareResult={settings.AntiCapture}, gpu={settings.GpuProtection}, monitorOnly={settings.HardwareMonitorOnly}");
+                Logger.Info($"Settings saved immediately: path='{AppPaths.SettingsFile}', protection={settings.ProtectionLevel}, softwareResult={settings.AntiCapture}, gpu={settings.GpuProtection}");
         }
     }
 

@@ -27,7 +27,7 @@ internal sealed class DuplicationCapture : IDisposable
     public void ResetProtectionStatus() { lock (_sync) { if (_thread?.IsAlive == true) throw new InvalidOperationException("Stop output before clearing its protection status."); Volatile.Write(ref _gpuProtectionStatus, GpuProtectionStatus.Off); } }
     public void Start(MonitorInfo input, MonitorInfo output, int threshold, float sharpness, ScalingMode scaling, IntPtr overlayHwnd, CaptureOptions options)
     {
-        lock (_sync) { StopInternal(); _input = input; _output = output; _threshold = threshold; _sharpness = sharpness; _scaling = scaling; _overlayHwnd = overlayHwnd; _options = options; _metrics.Reset(); Volatile.Write(ref _gpuProtectionStatus, options.GpuProtection == GpuProtectionMode.Off ? GpuProtectionStatus.Off : GpuProtectionStatus.Pending); _cts = new CancellationTokenSource(); _thread = new Thread(() => CaptureLoop(_cts.Token)) { IsBackground = true, Name = "YarrOverlayCapture", Priority = options.ThreadPriority switch { CapturePriority.Highest => ThreadPriority.Highest, CapturePriority.AboveNormal => ThreadPriority.AboveNormal, _ => ThreadPriority.Normal } }; _thread.SetApartmentState(ApartmentState.MTA); _thread.Start(); }
+        lock (_sync) { StopInternal(); _input = input; _output = output; _threshold = threshold; _sharpness = sharpness; _scaling = scaling; _overlayHwnd = overlayHwnd; _options = options; _metrics.Reset(); Volatile.Write(ref _gpuProtectionStatus, options.GpuProtection == GpuProtectionMode.Off ? GpuProtectionStatus.Off : GpuProtectionStatus.Pending); _cts = new CancellationTokenSource(); _thread = new Thread(() => CaptureLoop(_cts.Token)) { IsBackground = true, Name = "OverlayCapture", Priority = options.ThreadPriority switch { CapturePriority.Highest => ThreadPriority.Highest, CapturePriority.AboveNormal => ThreadPriority.AboveNormal, _ => ThreadPriority.Normal } }; _thread.SetApartmentState(ApartmentState.MTA); _thread.Start(); }
     }
     public void SetThreshold(int threshold) => Volatile.Write(ref _threshold, threshold);
     public void SetSharpness(float sharpness) => Volatile.Write(ref _sharpness, Math.Clamp(sharpness, 0, 1));
@@ -358,8 +358,8 @@ float4 PSMain(O i):SV_TARGET { float2 uv=(i.uv-float2(.5,.5))/float2(scaleX,scal
             {
                 SourceTexture=d.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm,(uint)iw,(uint)ih,1,1,BindFlags.ShaderResource,ResourceUsage.Default,CpuAccessFlags.None,1,0,ResourceOptionFlags.None));
                 Srv=d.CreateShaderResourceView(SourceTexture); Sampler=d.CreateSamplerState(SamplerDescription.LinearClamp);
-                var vs=Compiler.Compile(ShaderSource,"VSMain","YarrOverlayGpu.hlsl","vs_4_0",ShaderFlags.OptimizationLevel3);
-                var ps=Compiler.Compile(ShaderSource,"PSMain","YarrOverlayGpu.hlsl","ps_4_0",ShaderFlags.OptimizationLevel3);
+                var vs=Compiler.Compile(ShaderSource,"VSMain","OverlayGpu.hlsl","vs_4_0",ShaderFlags.OptimizationLevel3);
+                var ps=Compiler.Compile(ShaderSource,"PSMain","OverlayGpu.hlsl","ps_4_0",ShaderFlags.OptimizationLevel3);
                 Vs=d.CreateVertexShader(vs.Span); Ps=d.CreatePixelShader(ps.Span);
                 Params=d.CreateBuffer(new BufferDescription((uint)Marshal.SizeOf<ShaderParams>(),BindFlags.ConstantBuffer));
             }

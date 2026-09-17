@@ -12,7 +12,7 @@ internal sealed class PerformanceDetailsWindow : Form
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 250 };
     public PerformanceDetailsWindow(AppState state)
     {
-        _state=state; Text="YarrOverlay — Full Latency Metrics"; ClientSize=new Size(1180,820); MinimumSize=new Size(900,600);
+        _state=state; Text="Overlay — Full Latency Metrics"; ClientSize=new Size(1180,820); MinimumSize=new Size(900,600);
         BackColor=Color.FromArgb(10,12,16); ForeColor=Color.Gainsboro;
         _text.Dock=DockStyle.Fill;_text.ReadOnly=true;_text.BorderStyle=BorderStyle.None;_text.BackColor=BackColor;_text.ForeColor=ForeColor;_text.Font=new Font("Consolas",10f);_text.WordWrap=false;_text.ScrollBars=RichTextBoxScrollBars.Both;Controls.Add(_text);
         _timer.Tick+=(_,_)=>RefreshText();_timer.Start();RefreshText();

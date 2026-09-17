@@ -13,7 +13,7 @@ if errorlevel 1 (
 
 if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
 
-echo Building YarrOverlay as a self-contained single EXE...
+echo Building Overlay as a self-contained single EXE...
 dotnet publish "%PROJECT_FILE%" ^
     --configuration Release ^
     --runtime win-x64 ^
@@ -30,7 +30,7 @@ if errorlevel 1 goto :failed
 
 echo.
 echo Build completed:
-echo %OUTPUT_DIR%\YarrOverlay.exe
+echo %OUTPUT_DIR%\Overlay.exe
 goto :finished
 
 :failed

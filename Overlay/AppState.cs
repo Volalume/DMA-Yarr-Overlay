@@ -8,7 +8,7 @@ namespace Overlay;
 internal sealed class AppState : IDisposable
 {
     private readonly DuplicationCapture _capture = new();
-    private readonly OverlayHost _overlayHost = new();
+    private readonly OverlayHost _overlayHost;
     private readonly KernelCaptureProtection _kernelProtection = new();
     private readonly AppSettings _settings;
     private IntPtr _settingsWindowHandle;
@@ -19,6 +19,9 @@ internal sealed class AppState : IDisposable
     public AppState()
     {
         _settings = SettingsStore.Load();
+        NormalizeBranding();
+        ActiveWindowClassName = _settings.WindowClassName;
+        _overlayHost = new OverlayHost(ActiveWindowClassName);
         if (!Enum.IsDefined(_settings.AntiCapture)) _settings.AntiCapture = AntiCaptureMode.Off;
         if (!Enum.IsDefined(_settings.ProtectionLevel)) _settings.ProtectionLevel = CaptureProtectionLevel.Off;
         // Migrate settings written before the unified protection level was persisted.
@@ -31,6 +34,7 @@ internal sealed class AppState : IDisposable
         }
         // Unknown nonzero protection settings stay fail-closed in the capture worker.
         ApplyEffectiveCaptureProtection();
+        _overlayHost.SetBranding(_settings.AppDisplayName, _settings.WindowTitle, _settings.IconPath);
         Monitors = MonitorInfo.Enumerate();
         if (Monitors.Count == 0) throw new InvalidOperationException("No active DXGI outputs detected.");
         SelectedInputIndex = Resolve(_settings.CaptureDisplay, capture: true);
@@ -69,9 +73,13 @@ internal sealed class AppState : IDisposable
     public bool CsvEnabled => _settings.CsvEnabled;
     public bool LatencyTestMode => _settings.LatencyTestMode;
     public bool AlwaysOnTop => _settings.AlwaysOnTop;
+    public string AppDisplayName => _settings.AppDisplayName;
+    public string WindowTitle => _settings.WindowTitle;
+    public string WindowClassName => _settings.WindowClassName;
+    public string ActiveWindowClassName { get; }
+    public string IconPath => _settings.IconPath;
     public AntiCaptureMode AntiCapture => _settings.AntiCapture;
     public GpuProtectionMode GpuProtection => _settings.GpuProtection;
-    public bool HardwareMonitorOnly => _settings.HardwareMonitorOnly;
     public CaptureProtectionLevel ProtectionLevel => _settings.ProtectionLevel;
     public GpuProtectionStatus GpuOutputStatus => _settings.GpuProtection == GpuProtectionMode.Off
         ? GpuProtectionStatus.Off
@@ -110,6 +118,24 @@ internal sealed class AppState : IDisposable
     {
         index = Math.Clamp(index, 0, Monitors.Count - 1); if (index == SelectedOutputIndex) return;
         SelectedOutputIndex = index; UpdateOutputMonitor(); Save(); if (IsRunning) RestartCapture("output display changed"); StateChanged?.Invoke();
+    }
+    public void SetBranding(string appDisplayName, string windowTitle, string windowClassName, string iconPath)
+    {
+        _settings.AppDisplayName = NormalizeLabel(appDisplayName, "Overlay", 48);
+        _settings.WindowTitle = NormalizeLabel(windowTitle, $"{_settings.AppDisplayName} Control", 96);
+        _settings.WindowClassName = NormalizeWindowClassName(windowClassName);
+        iconPath = (iconPath ?? "").Trim();
+        if (iconPath.Length > 0)
+        {
+            if (!System.IO.File.Exists(iconPath)) throw new System.IO.FileNotFoundException("ICO file not found.", iconPath);
+            if (!string.Equals(System.IO.Path.GetExtension(iconPath), ".ico", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The app icon must be an .ico file.");
+            using var testIcon = new System.Drawing.Icon(iconPath);
+        }
+        _settings.IconPath = iconPath;
+        _overlayHost.SetBranding(_settings.AppDisplayName, _settings.WindowTitle, _settings.IconPath);
+        Save(immediate: true);
+        StateChanged?.Invoke();
     }
     public void SetThreshold(int value)
     {
@@ -231,27 +257,11 @@ internal sealed class AppState : IDisposable
             _settings.AntiCapture = AntiCaptureMode.Off;
         // A new HWND guarantees that a protected DirectComposition target and its
         // display-affinity state cannot leak across protection-level transitions.
-        if (!restart || value != CaptureProtectionLevel.Hardware)
-            _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
+        _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
         ApplyEffectiveCaptureProtection(requireKernel: value == CaptureProtectionLevel.Kernel);
         Save(immediate: true);
         if (restart) Start();
         LogProtectionState("protection level change completed");
-        StateChanged?.Invoke();
-    }
-    public void SetHardwareMonitorOnly(bool value)
-    {
-        if (value == _settings.HardwareMonitorOnly) return;
-        var restart = IsRunning;
-        Logger.Info($"Hardware Monitor Only change requested: value={value}; running={restart}");
-        Stop();
-        _settings.HardwareMonitorOnly = value;
-        if (ProtectionLevel == CaptureProtectionLevel.Hardware)
-            _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
-        ApplyEffectiveCaptureProtection();
-        Save(immediate: true);
-        if (restart) Start();
-        LogProtectionState("hardware monitor-only change completed");
         StateChanged?.Invoke();
     }
     public void SetUiHotkey(HotkeyBinding value)
@@ -311,13 +321,11 @@ internal sealed class AppState : IDisposable
     private AntiCaptureMode EffectiveOverlayAntiCaptureMode => ProtectionLevel switch
     {
         CaptureProtectionLevel.Software => _settings.AntiCapture,
-        CaptureProtectionLevel.Hardware when _settings.HardwareMonitorOnly => AntiCaptureMode.Black,
         _ => AntiCaptureMode.Off
     };
     private AntiCaptureMode EffectiveHudAntiCaptureMode => ProtectionLevel switch
     {
         CaptureProtectionLevel.Software => _settings.AntiCapture,
-        CaptureProtectionLevel.Hardware when _settings.HardwareMonitorOnly => AntiCaptureMode.Black,
         _ => AntiCaptureMode.Off
     };
     private void ApplyEffectiveCaptureProtection(bool requireKernel = false)
@@ -356,8 +364,7 @@ internal sealed class AppState : IDisposable
         var actual = $"Overlay {windows.Overlay.ActualLabel} / HUD {windows.Hud.ActualLabel}";
         var offModesMatch = windows.Overlay.Requested == AntiCaptureMode.Off && windows.Hud.Requested == AntiCaptureMode.Off;
         var softwareModesMatch = windows.Overlay.Requested == _settings.AntiCapture && windows.Hud.Requested == _settings.AntiCapture;
-        var expectedHardwareAffinity = _settings.HardwareMonitorOnly ? AntiCaptureMode.Black : AntiCaptureMode.Off;
-        var hardwareModesMatch = windows.Overlay.Requested == expectedHardwareAffinity && windows.Hud.Requested == expectedHardwareAffinity;
+        var hardwareModesMatch = windows.Overlay.Requested == AntiCaptureMode.Off && windows.Hud.Requested == AntiCaptureMode.Off;
         var requested = $"requested Overlay {windows.Overlay.Requested} / HUD {windows.Hud.Requested}";
         var settingsAffinity = ReadDisplayAffinity(_settingsWindowHandle);
         var affinityLabel = $"Affinity: Overlay {windows.Overlay.ActualLabel} | HUD {windows.Hud.ActualLabel} | Settings {settingsAffinity.Label}";
@@ -377,7 +384,7 @@ internal sealed class AppState : IDisposable
             CaptureProtectionLevel.Software => new(windowVerified && softwareModesMatch, !windowVerified || !softwareModesMatch,
                 $"SOFTWARE {_settings.AntiCapture.ToString().ToUpperInvariant()} · {actual}", $"{requested}; {windows.Detail}", affinityLabel),
             CaptureProtectionLevel.Hardware => new(windowVerified && hardwareModesMatch && gpu.Active, gpu.Blocked || !windowVerified || !hardwareModesMatch,
-                $"HARDWARE {(gpu.Active ? "ACTIVE" : gpu.Summary.ToUpperInvariant())} · {actual}", $"GPU protected/display-only; Monitor Only={_settings.HardwareMonitorOnly}. {gpu.Detail} | {requested}; {windows.Detail}", affinityLabel),
+                $"HARDWARE {(gpu.Active ? "ACTIVE" : gpu.Summary.ToUpperInvariant())} · {actual}", $"GPU protected/display-only. {gpu.Detail} | {requested}; {windows.Detail}", affinityLabel),
             CaptureProtectionLevel.Kernel => new(_kernelProtection.State.Active && kernelAffinityIsNone,
                 _kernelProtection.State.Failed || !kernelAffinityIsNone,
                 $"KERNEL · {_kernelProtection.State.Summary}",
@@ -410,6 +417,38 @@ internal sealed class AppState : IDisposable
     }
     private int Wrap(int index) => index < 0 ? Monitors.Count - 1 : index >= Monitors.Count ? 0 : index;
     private void Save(bool immediate = false) { _settings.CaptureDisplay = DisplaySelection.From(CurrentInputMonitor); _settings.OutputDisplay = DisplaySelection.From(CurrentOutputMonitor); _settings.ChromaThreshold = ChromaThreshold; _settings.Sharpness = Sharpness; _settings.ScalingMode = ScalingMode; if (immediate) SettingsStore.SaveNow(_settings); else SettingsStore.Save(_settings); }
+    private void NormalizeBranding()
+    {
+        // Upgrade only the former built-in defaults. User-entered branding is
+        // intentionally preserved.
+        if (string.Equals(_settings.AppDisplayName, "YarrOverlay", StringComparison.OrdinalIgnoreCase))
+            _settings.AppDisplayName = "Overlay";
+        if (string.Equals(_settings.WindowTitle, "YarrOverlay Control", StringComparison.OrdinalIgnoreCase))
+            _settings.WindowTitle = "Overlay";
+        if (string.Equals(_settings.WindowClassName, "YarrOverlay.Window", StringComparison.OrdinalIgnoreCase))
+            _settings.WindowClassName = "Overlay.Window";
+        _settings.AppDisplayName = NormalizeLabel(_settings.AppDisplayName, "Overlay", 48);
+        _settings.WindowTitle = NormalizeLabel(_settings.WindowTitle, $"{_settings.AppDisplayName} Control", 96);
+        try { _settings.WindowClassName = NormalizeWindowClassName(_settings.WindowClassName); }
+        catch { _settings.WindowClassName = "Overlay.Window"; }
+        if (!string.IsNullOrWhiteSpace(_settings.IconPath) && !System.IO.File.Exists(_settings.IconPath))
+            _settings.IconPath = "";
+    }
+    private static string NormalizeLabel(string? value, string fallback, int maximumLength)
+    {
+        var cleaned = new string((value ?? "").Where(c => !char.IsControl(c)).ToArray()).Trim();
+        if (cleaned.Length == 0) cleaned = fallback;
+        return cleaned.Length <= maximumLength ? cleaned : cleaned[..maximumLength];
+    }
+    private static string NormalizeWindowClassName(string? value)
+    {
+        var name = (value ?? "").Trim();
+        if (name.Length is < 1 or > 128)
+            throw new InvalidOperationException("Window class name must contain 1 to 128 characters.");
+        if (name.Any(c => !(char.IsLetterOrDigit(c) || c is '.' or '_' or '-')))
+            throw new InvalidOperationException("Window class name may contain only letters, numbers, dots, underscores and hyphens.");
+        return name;
+    }
 }
 
 internal readonly record struct CaptureProtectionVerification(bool Verified, bool Failed, string Label, string Detail, string? AffinityLabel = null);
