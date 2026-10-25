@@ -9,9 +9,9 @@ The normal path stays on the GPU: DXGI Desktop Duplication captures the source, 
 ## Compatibility(Capture Protection) & Risk
 | Anti-Cheat | Notes |
 |---|---|
-| <img src="https://cdn.mos.cms.futurecdn.net/v2/t%3A0%2Cl%3A420%2Ccw%3A1080%2Cch%3A1080%2Cq%3A80%2Cw%3A1080/DENaxLnLwXAX4KehjMhvtC.png" width="28" alt="Riot Vanguard"> **VGK** | BitBlt/nvapi64 - Protectable  |
+| <img src="https://www.riotgames.com/darkroom/390/f32bf076f5f8c93d608867d8faf891ed:ea4ed48eae58a1ed31baffe93d975bc9/vg-red-cropped.png" width="28" alt="Riot Vanguard"> **VGK** | BitBlt/nvapi64 - Protectable  |
 | <img src="https://tibiawiki.com.br/images/1/1e/BattlEye_logo.jpeg" width="28" alt="BattlEye"> **BattlEye** | Protectable  |
-| <img src="https://dritestudio.co.th/_image?f=webp&h=1080&href=https%3A%2F%2Fcdn.dritestudio.co.th%2Fapi%2Fimg%2Fcllki7ruz0000b7vzx4vu5evb&q=85&w=1920" width="28" alt="Easy Anti-Cheat"> **Easy Anti-Cheat** | Protectable |
+| <img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSyKNoA8gfdtfA8eU8wsykMG19GrV0wOL6xaUZl80Ea2PV3MvUk2617vrg&s=10" width="28" alt="Easy Anti-Cheat"> **Easy Anti-Cheat** | Protectable |
 | <img src="https://images.steamusercontent.com/ugc/17370001691733085149/1878F6828ADB450188E2FB1FE9A9AD946C2F3010/?ima=fit&imcolor=%23000000&imh=512&impolicy=Letterbox&imw=512&letterbox=true" width="28" alt="ACE"> **ACE** | BitBlt - Protectable |
 | <img src="https://cdn.neowin.com/news/images/uploaded/2021/10/1634149586_ricochet_anti-cheat-tout.jpg" width="28" alt="RICOCHET Anti-Cheat"> **RICOCHET** | Protectable |
 
