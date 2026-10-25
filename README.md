@@ -6,6 +6,15 @@ YarrOverlay replaces the display-compositing role of a hardware DMA Fuser with a
 
 The normal path stays on the GPU: DXGI Desktop Duplication captures the source, a D3D11 shader performs chroma removal, scaling, and sharpening, and DirectComposition presents the result. When **Hardware Level** protection is selected, the source switches to Windows Graphics Capture so Parsec's virtual-display transitions do not invalidate Desktop Duplication; the protected DirectComposition output remains unchanged. A virtual display running a full-screen Parsec session is the intended source, but any separate active Windows display can be used.
 
+## Compatibility(Capture Protection) & Risk
+| Anti-Cheat | Notes |
+|---|---|
+| <img src="https://cdn.mos.cms.futurecdn.net/v2/t%3A0%2Cl%3A420%2Ccw%3A1080%2Cch%3A1080%2Cq%3A80%2Cw%3A1080/DENaxLnLwXAX4KehjMhvtC.png" width="28" alt="Riot Vanguard"> **VGK** | BitBlt/nvapi64 - Protectable  |
+| <img src="https://tibiawiki.com.br/images/1/1e/BattlEye_logo.jpeg" width="28" alt="BattlEye"> **BattlEye** | Protectable  |
+| <img src="https://dritestudio.co.th/_image?f=webp&h=1080&href=https%3A%2F%2Fcdn.dritestudio.co.th%2Fapi%2Fimg%2Fcllki7ruz0000b7vzx4vu5evb&q=85&w=1920" width="28" alt="Easy Anti-Cheat"> **Easy Anti-Cheat** | Protectable |
+| <img src="https://images.steamusercontent.com/ugc/17370001691733085149/1878F6828ADB450188E2FB1FE9A9AD946C2F3010/?ima=fit&imcolor=%23000000&imh=512&impolicy=Letterbox&imw=512&letterbox=true" width="28" alt="ACE"> **ACE** | BitBlt - Protectable |
+| <img src="https://cdn.neowin.com/news/images/uploaded/2021/10/1634149586_ricochet_anti-cheat-tout.jpg" width="28" alt="RICOCHET Anti-Cheat"> **RICOCHET** | Protectable |
+
 ## Highlights
 
 - GPU-native capture and DirectComposition output with no full-frame CPU readback
@@ -82,6 +91,8 @@ Open **Settings → Anti-Capture** and select one level:
 - **Software Level:** uses Windows display affinity for both the output overlay and latency HUD. `Black` returns a black protected region in supported capture paths; `Exclude` omits the protected windows so the desktop underneath can remain visible.
 - **Hardware Level:** experimental. Requires `Auto` or `GPU Native`, both displays on the same GPU, and compatible WDDM/GPU drivers. It combines verified `Black` window affinity with a `HW_PROTECTED | DISPLAY_ONLY` GPU swap chain. Its source uses Windows Graphics Capture instead of Desktop Duplication to avoid Parsec/VDD invalidation. It never falls back to an unprotected or CPU path while selected.
 - **Kernel Level:** reserved in the UI and not implemented.
+
+> **Recommendation:** Hardware Level may introduce noticeably higher latency because it uses a different protected capture path. For normal use, **Software Level + Exclude** is recommended when it provides enough protection for your setup.
 
 Changing a level or switching between `Black` and `Exclude` rebuilds the output window and renderer immediately; restarting YarrOverlay is not required. The colored label reads the current Windows value with `GetWindowDisplayAffinity` instead of repeating the selected option:
 
