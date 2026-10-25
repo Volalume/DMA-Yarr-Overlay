@@ -10,7 +10,13 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
-        WaitForRestartParent(Environment.GetCommandLineArgs());
+        var args = Environment.GetCommandLineArgs();
+        if (GpuScanoutProtection.TryRunHelper(args, out var helperExitCode))
+        {
+            Environment.ExitCode = helperExitCode;
+            return;
+        }
+        WaitForRestartParent(args);
         using var singleInstance = new Mutex(true, @"Local\Overlay.SingleInstance", out var isFirstInstance);
         if (!isFirstInstance)
         {

@@ -28,6 +28,10 @@ internal sealed class SettingsWindow : Form
     private bool _changingVisibility;
     private bool _disposed;
     private Icon? _customIcon;
+    private PerformanceDetailsWindow? _performanceDetails;
+    private bool _gpuScanoutOperationPending;
+    private long _nextGpuScanoutProbe;
+    private GpuScanoutProtection.ProbeResult _gpuScanoutProbe;
     private readonly string _windowClassName;
     private static readonly string[] ProtectionLevelNames = { "Off", "Software Level", "Hardware Level", "Kernel Level" };
 
@@ -239,6 +243,8 @@ internal sealed class SettingsWindow : Form
             _renderTimer.Dispose();
             _customIcon?.Dispose();
             _customIcon = null;
+            if (_performanceDetails is { IsDisposed: false }) _performanceDetails.Close();
+            _performanceDetails = null;
         }
 
         base.Dispose(disposing);
@@ -371,83 +377,153 @@ internal sealed class SettingsWindow : Form
         var recent = p?.TenSeconds ?? WindowPerformance.Empty;
 
         ImGui.Spacing();
-        BeginCard("LatencyCard", 120, "APP LATENCY");
-        ImGui.PushFont(_controller!.MonoFont, 0);
-        ImGui.TextColored(ImGuiTheme.AccentBright, $"{Format(p?.TotalAppLatencyEstimateMs),7} ms");
-        ImGui.SameLine();
-        ImGui.Text($"AVG {Format(recent.DesktopToSubmit.Average)}   P95 {Format(recent.DesktopToSubmit.P95)}   P99 {Format(recent.DesktopToSubmit.P99)}");
-        ImGui.PopFont();
-        ImGui.TextDisabled($"Submit {recent.SubmitFps:F1} FPS  |  CPU submit {Format(recent.Pipeline.Current)} ms");
-        ImGui.EndChild();
+        BeginCard("PerformanceCard", 470, "PERFORMANCE");
+
+        if (ImGui.BeginTable("LatencySummary", 3, ImGuiTableFlags.SizingStretchSame))
+        {
+            ImGui.TableNextColumn();
+            ImGui.TextDisabled("TOTAL LATENCY");
+            ImGui.PushFont(_controller!.MonoFont, 0);
+            ImGui.TextColored(ImGuiTheme.AccentBright, $"{Format(p?.TotalAppLatencyEstimateMs)} ms");
+            ImGui.PopFont();
+
+            ImGui.TableNextColumn();
+            ImGui.TextDisabled("10 SECOND WINDOW");
+            ImGui.Text($"AVG {Format(recent.DesktopToSubmit.Average)} ms  |  P95 {Format(recent.DesktopToSubmit.P95)} ms");
+
+            ImGui.TableNextColumn();
+            ImGui.TextDisabled("OUTPUT");
+            ImGui.Text($"{recent.SubmitFps:F1} FPS  |  CPU {Format(recent.Pipeline.Current)} ms");
+            ImGui.EndTable();
+        }
 
         ImGui.Spacing();
-        BeginCard("TuningCard", 210, "PIPELINE");
+        ImGui.SeparatorText("TUNING");
         if (ImGui.BeginTable("TuningGrid", 2, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV))
         {
             ImGui.TableNextColumn();
-            var pipeline = (int)_state.PipelineMode;
-            ImGui.SetNextItemWidth(-145);
-            if (ImGui.Combo("Pipeline", ref pipeline, "Auto\0GPU Native\0Legacy CPU\0")) RunUiAction(() => _state.SetPipelineMode((PipelineMode)pipeline));
+            if (ImGui.BeginTable("TuningLeft", 2, ImGuiTableFlags.SizingStretchProp))
+            {
+                ImGui.TableSetupColumn("Label", ImGuiTableColumnFlags.WidthFixed);
+                ImGui.TableSetupColumn("Control", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("Pipeline");
+                ImGui.TableNextColumn();
+                var pipeline = (int)_state.PipelineMode;
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.Combo("##Pipeline", ref pipeline, "Auto\0GPU Native\0Legacy CPU\0")) RunUiAction(() => _state.SetPipelineMode((PipelineMode)pipeline));
 
-            var maxLatency = _state.MaximumFrameLatency;
-            ImGui.SetNextItemWidth(-145);
-            if (ImGui.SliderInt("Maximum Frame Latency", ref maxLatency, 1, 3, "%d")) RunUiAction(() => _state.SetMaximumFrameLatency(maxLatency));
-            ImGui.TextDisabled("Present mode: Immediate");
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("Frame Latency");
+                ImGui.TableNextColumn();
+                var maxLatency = _state.MaximumFrameLatency;
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.SliderInt("##MaximumFrameLatency", ref maxLatency, 1, 3, "%d")) RunUiAction(() => _state.SetMaximumFrameLatency(maxLatency));
+
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("Latency HUD");
+                ImGui.TableNextColumn();
+                var hud = (int)_state.PerformanceHud;
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.Combo("##LatencyHud", ref hud, "Off\0Basic\0Detailed\0")) RunUiAction(() => _state.SetHudMode((PerformanceHudMode)hud));
+                ImGui.EndTable();
+            }
 
             ImGui.TableNextColumn();
-            var priority = (int)_state.CapturePriority;
-            ImGui.SetNextItemWidth(-145);
-            if (ImGui.Combo("Capture Priority", ref priority, "Normal\0Above Normal\0Highest\0")) RunUiAction(() => _state.SetCapturePriority((CapturePriority)priority));
+            if (ImGui.BeginTable("TuningRight", 2, ImGuiTableFlags.SizingStretchProp))
+            {
+                ImGui.TableSetupColumn("Label", ImGuiTableColumnFlags.WidthFixed);
+                ImGui.TableSetupColumn("Control", ImGuiTableColumnFlags.WidthStretch);
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("Priority");
+                ImGui.TableNextColumn();
+                var priority = (int)_state.CapturePriority;
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.Combo("##CapturePriority", ref priority, "Normal\0Above Normal\0Highest\0")) RunUiAction(() => _state.SetCapturePriority((CapturePriority)priority));
 
-            var mmcss = _state.MmcssEnabled;
-            if (ImGui.Checkbox("MMCSS Games profile", ref mmcss)) RunUiAction(() => _state.SetMmcssEnabled(mmcss));
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("MMCSS");
+                ImGui.TableNextColumn();
+                var mmcss = _state.MmcssEnabled;
+                if (ImGui.Checkbox("Games profile", ref mmcss)) RunUiAction(() => _state.SetMmcssEnabled(mmcss));
 
-            var metrics = (int)_state.MetricsMode;
-            ImGui.SetNextItemWidth(-145);
-            if (ImGui.Combo("Metrics", ref metrics, "Off\0Lightweight\0Detailed GPU\0")) RunUiAction(() => _state.SetMetricsMode((MetricsMode)metrics));
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("Present");
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.TextDisabled("Immediate");
+                ImGui.EndTable();
+            }
+            ImGui.EndTable();
+        }
+
+        ImGui.Spacing();
+        ImGui.SeparatorText("TOOLS");
+        if (ImGui.BeginTable("ToolsGrid", 2, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV))
+        {
+            ImGui.TableNextColumn();
+            var showDetails = _performanceDetails is { IsDisposed: false, Visible: true };
+            if (ImGui.Checkbox("Detailed Metrics Window", ref showDetails)) SetPerformanceDetailsVisible(showDetails);
+            var csv = _state.CsvEnabled;
+            if (ImGui.Checkbox("CSV logging", ref csv)) RunUiAction(() => _state.SetCsvEnabled(csv));
+            var latencyTest = _state.LatencyTestMode;
+            if (ImGui.Checkbox("Latency test mode", ref latencyTest)) RunUiAction(() => _state.SetLatencyTestMode(latencyTest));
+
+            ImGui.TableNextColumn();
+            if (ImGui.BeginTable("ToolsRight", 2, ImGuiTableFlags.SizingStretchProp))
+            {
+                ImGui.TableSetupColumn("Label", ImGuiTableColumnFlags.WidthFixed);
+                ImGui.TableSetupColumn("Control", ImGuiTableColumnFlags.WidthStretch);
+
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("Collection");
+                ImGui.TableNextColumn();
+                var metrics = (int)_state.MetricsMode;
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.Combo("##MetricsCollection", ref metrics, "Off\0Lightweight\0Detailed GPU\0")) RunUiAction(() => _state.SetMetricsMode((MetricsMode)metrics));
+
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("CSV interval");
+                ImGui.TableNextColumn();
+                var csvInterval = _state.CsvIntervalFrames;
+                ImGui.BeginDisabled(!csv);
+                ImGui.SetNextItemWidth(-1);
+                if (ImGui.SliderInt("##CsvWriteInterval", ref csvInterval, 1, 240, "%d frames")) RunUiAction(() => _state.SetCsvIntervalFrames(csvInterval));
+                ImGui.EndDisabled();
+
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding(); ImGui.Text("Health");
+                ImGui.TableNextColumn(); ImGui.AlignTextToFramePadding();
+                ImGui.TextDisabled($"Q {p?.QueueLength ?? 0}/{p?.MaxQueueLength ?? 0} | Drop {p?.DroppedFrames ?? 0} | DXGI {p?.DxgiErrors ?? 0}");
+                ImGui.EndTable();
+            }
             ImGui.EndTable();
         }
         ImGui.EndChild();
+    }
 
-        ImGui.Spacing();
-        // Only this card scrolls. Leave room for the footer without changing the
-        // window size or adding a clipping/scrolling surface around the whole tab.
-        var footerReserve = ImGui.GetTextLineHeightWithSpacing() * 2
-            + ImGui.GetStyle().WindowPadding.Y + ImGui.GetStyle().ItemSpacing.Y * 2;
-        var metricsHeight = Math.Max(1, ImGui.GetContentRegionAvail().Y - footerReserve);
-        BeginCard("MetricsCard", metricsHeight, "METRICS", scrollable: true);
-        if (ImGui.BeginTable("StageMetrics", 3, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.RowBg))
+    private void SetPerformanceDetailsVisible(bool visible)
+    {
+        if (!visible)
         {
-            ImGui.TableSetupColumn("Stage");
-            ImGui.TableSetupColumn("Current");
-            ImGui.TableSetupColumn("10 s average");
-            ImGui.TableHeadersRow();
-            DrawMetricRow("App pipeline", recent.Pipeline);
-            DrawMetricRow("Desktop -> submit", recent.DesktopToSubmit);
-            DrawMetricRow("Frame age", recent.FrameAge);
-            DrawMetricRow("Acquire wait", recent.AcquireWait);
-            DrawMetricRow("CPU copy", recent.CpuCopy);
-            DrawMetricRow("UI queue", recent.UiQueue);
-            DrawMetricRow("GPU copy", recent.GpuCopy);
-            DrawMetricRow("GPU shader / total", recent.GpuShader, recent.GpuTotal);
-            ImGui.EndTable();
+            _performanceDetails?.Close();
+            return;
         }
-        ImGui.TextDisabled($"Queue {p?.QueueLength ?? 0}/{p?.MaxQueueLength ?? 0}  |  dropped {p?.DroppedFrames ?? 0}  |  replaced {p?.ReplacedFrames ?? 0}  |  DXGI errors {p?.DxgiErrors ?? 0}");
-        ImGui.Spacing();
-        var hud = (int)_state.PerformanceHud;
-        ImGui.SetNextItemWidth(170);
-        if (ImGui.Combo("Latency HUD", ref hud, "Off\0Basic\0Detailed\0")) RunUiAction(() => _state.SetHudMode((PerformanceHudMode)hud));
-        ImGui.SameLine();
-        var csv = _state.CsvEnabled;
-        if (ImGui.Checkbox("CSV", ref csv)) RunUiAction(() => _state.SetCsvEnabled(csv));
-        ImGui.SameLine();
-        var csvInterval = _state.CsvIntervalFrames;
-        ImGui.SetNextItemWidth(130);
-        if (ImGui.SliderInt("CSV interval", ref csvInterval, 1, 240, "%d frames")) RunUiAction(() => _state.SetCsvIntervalFrames(csvInterval));
-        ImGui.SameLine();
-        var latencyTest = _state.LatencyTestMode;
-        if (ImGui.Checkbox("Latency test", ref latencyTest)) RunUiAction(() => _state.SetLatencyTestMode(latencyTest));
-        ImGui.EndChild(); // MetricsCard (the card itself owns scrolling)
+
+        if (_performanceDetails is null || _performanceDetails.IsDisposed)
+        {
+            var details = new PerformanceDetailsWindow(_state)
+            {
+                StartPosition = FormStartPosition.CenterParent,
+                TopMost = _state.AlwaysOnTop
+            };
+            details.FormClosed += (_, _) =>
+            {
+                if (ReferenceEquals(_performanceDetails, details)) _performanceDetails = null;
+            };
+            _performanceDetails = details;
+        }
+
+        _performanceDetails.Show(this);
+        _performanceDetails.Activate();
     }
 
     private void DrawSettingsTab()
@@ -524,6 +600,19 @@ internal sealed class SettingsWindow : Form
             if (ImGui.Combo("Capture result", ref appearance, "Black\0Exclude\0"))
                 RunProtectionUiAction(() => _state.SetAntiCaptureMode(appearance == 0 ? AntiCaptureMode.Black : AntiCaptureMode.Exclude));
         }
+        var scanoutProtection = _state.GpuScanoutCaptureProtection;
+        ImGui.BeginDisabled(_gpuScanoutOperationPending);
+        if (ImGui.Checkbox("GPU Scanout Capture Protection (VGK)", ref scanoutProtection))
+        {
+            var requestedState = scanoutProtection;
+            BeginInvoke(new Action(() => RequestGpuScanoutProtection(requestedState)));
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Blocks hardware capture at the GPU scanout buffer level through the GPU driver.\n\nWhile this option is enabled the related driver file under Win32 is safely backed up and temporarily removed.\n\nEven if you delete the backup theres no need to worry since the file will be restored after a reboot or by reinstalling the GPU driver.");
+        ImGui.EndDisabled();
+        if (!_gpuScanoutOperationPending)
+            RefreshGpuScanoutProbe();
+        DrawGpuScanoutStatus();
         RefreshProtectionVerification();
         var verificationColor = _protectionVerification.Failed ? ImGuiTheme.Warning
             : _protectionVerification.Verified ? ImGuiTheme.Good : ImGuiTheme.Accent;
@@ -579,6 +668,83 @@ internal sealed class SettingsWindow : Form
         _nextProtectionVerification = now + Stopwatch.Frequency / 2;
         try { _protectionVerification = _state.InspectCaptureProtection(); }
         catch (Exception ex) { _protectionVerification = new(false, true, "VERIFICATION FAILED", ex.Message); }
+    }
+
+    private void RefreshGpuScanoutProbe()
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (now < _nextGpuScanoutProbe) return;
+        _nextGpuScanoutProbe = now + Stopwatch.Frequency * 4;
+        _gpuScanoutProbe = GpuScanoutProtection.ProbeLoadLibrary();
+    }
+
+    private void DrawGpuScanoutStatus()
+    {
+        if (_gpuScanoutOperationPending)
+        {
+            ImGui.TextColored(ImGuiTheme.Accent, "● NVAPI CHANGE IN PROGRESS");
+            return;
+        }
+        if (!_gpuScanoutProbe.FilePresent && !_gpuScanoutProbe.Loadable)
+        {
+            ImGui.TextColored(ImGuiTheme.Good, "● NVAPI NOT LOADED · SCANOUT PATH BLOCKED");
+            return;
+        }
+        if (!_gpuScanoutProbe.FilePresent)
+        {
+            ImGui.TextColored(ImGuiTheme.Warning, "● NVAPI STILL LOADED · RESTART APPS");
+            return;
+        }
+        if (_gpuScanoutProbe.Loadable)
+        {
+            ImGui.TextColored(ImGuiTheme.Warning, "● NVAPI LOADED · CAPTURABLE");
+            return;
+        }
+        ImGui.TextColored(ImGuiTheme.Warning, $"● NVAPI PRESENT · LOAD FAILED ({_gpuScanoutProbe.ErrorCode})");
+    }
+
+    private void RequestGpuScanoutProtection(bool enabled)
+    {
+        if (_gpuScanoutOperationPending) return;
+        if (enabled)
+        {
+            var result = MessageBox.Show(
+                this,
+                "This option temporarily backs up and removes NVIDIA's nvapi64.dll from System32. It can interrupt NVIDIA-dependent applications. Continue?",
+                "GPU Scanout Capture Protection",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (result != DialogResult.Yes) return;
+        }
+
+        _gpuScanoutOperationPending = true;
+        _notification = enabled ? "Removing nvapi64.dll..." : "Restoring nvapi64.dll...";
+        _ = Task.Run(() =>
+        {
+            Exception? failure = null;
+            try { _state.SetGpuScanoutCaptureProtection(enabled); }
+            catch (Exception ex) { failure = ex; }
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    _gpuScanoutOperationPending = false;
+                    _nextGpuScanoutProbe = 0;
+                    _notification = failure is null
+                        ? enabled ? "GPU scanout capture protection enabled." : "GPU scanout capture protection disabled."
+                        : failure.Message;
+                    if (failure is not null)
+                        MessageBox.Show(
+                            this,
+                            failure.Message,
+                            "GPU Scanout Capture Protection",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+                }));
+            }
+            catch { }
+        });
     }
 
     private void DrawMetricRow(string label, TimingStats stats, TimingStats? secondary = null)

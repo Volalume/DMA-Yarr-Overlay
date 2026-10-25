@@ -80,6 +80,7 @@ internal sealed class AppState : IDisposable
     public string IconPath => _settings.IconPath;
     public AntiCaptureMode AntiCapture => _settings.AntiCapture;
     public GpuProtectionMode GpuProtection => _settings.GpuProtection;
+    public bool GpuScanoutCaptureProtection => GpuScanoutProtection.IsActive;
     public CaptureProtectionLevel ProtectionLevel => _settings.ProtectionLevel;
     public GpuProtectionStatus GpuOutputStatus => _settings.GpuProtection == GpuProtectionMode.Off
         ? GpuProtectionStatus.Off
@@ -195,12 +196,17 @@ internal sealed class AppState : IDisposable
     {
         if (value == _settings.AlwaysOnTop) return; _settings.AlwaysOnTop = value; Save(); StateChanged?.Invoke();
     }
+    public void SetGpuScanoutCaptureProtection(bool value)
+    {
+        if (value == GpuScanoutProtection.IsActive) return;
+        GpuScanoutProtection.SetEnabled(value);
+        StateChanged?.Invoke();
+    }
     public void RegisterSettingsWindow(IntPtr handle)
     {
         if (handle == IntPtr.Zero || !NativeMethods.IsWindow(handle)) return;
         _settingsWindowHandle = handle;
-        if (ProtectionLevel == CaptureProtectionLevel.Kernel)
-            ApplyEffectiveCaptureProtection();
+        ApplyEffectiveCaptureProtection();
         StateChanged?.Invoke();
     }
     public void UnregisterSettingsWindow(IntPtr handle)
@@ -229,7 +235,7 @@ internal sealed class AppState : IDisposable
         // DirectComposition surface even though GetWindowDisplayAffinity already
         // reports the new value. Recreate the HWND and its renderer so the new
         // policy takes effect immediately, just as it does after an app restart.
-        _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
+        _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveSoftwareAntiCaptureMode);
         ApplyEffectiveCaptureProtection();
         Save(immediate: true);
         if (restart) Start();
@@ -257,7 +263,7 @@ internal sealed class AppState : IDisposable
             _settings.AntiCapture = AntiCaptureMode.Off;
         // A new HWND guarantees that a protected DirectComposition target and its
         // display-affinity state cannot leak across protection-level transitions.
-        _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
+        _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveSoftwareAntiCaptureMode);
         ApplyEffectiveCaptureProtection(requireKernel: value == CaptureProtectionLevel.Kernel);
         Save(immediate: true);
         if (restart) Start();
@@ -291,7 +297,7 @@ internal sealed class AppState : IDisposable
             throw new InvalidOperationException("Capture Display and Output Display are identical. Change one selection to prevent a feedback loop.");
         UpdateOutputMonitor();
         if (_settings.GpuProtection != GpuProtectionMode.Off)
-            _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveOverlayAntiCaptureMode);
+            _overlayHost.ResetOutputWindow(CurrentOutputMonitor, EffectiveSoftwareAntiCaptureMode);
         Logger.Info($"Starting: capture={CurrentInputMonitor.Identity}; output={CurrentOutputMonitor.Identity}; different={CurrentInputMonitor.Identity != CurrentOutputMonitor.Identity}; captureSize={CurrentInputMonitor.Bounds.Size}; outputSize={CurrentOutputMonitor.Bounds.Size}; scaling={ScalingMode}");
         _overlayHost.ShowOverlay();
         try { ApplyEffectiveCaptureProtection(requireKernel: ProtectionLevel == CaptureProtectionLevel.Kernel); }
@@ -318,19 +324,18 @@ internal sealed class AppState : IDisposable
         });
     }
     private void RestartCapture(string reason) { Logger.Info($"Restarting duplication: {reason}"); _capture.Start(CurrentInputMonitor, CurrentOutputMonitor, ChromaThreshold, Sharpness / 100f, ScalingMode, _overlayHost.OverlayHandle, CaptureOptions.From(_settings)); }
-    private AntiCaptureMode EffectiveOverlayAntiCaptureMode => ProtectionLevel switch
-    {
-        CaptureProtectionLevel.Software => _settings.AntiCapture,
-        _ => AntiCaptureMode.Off
-    };
-    private AntiCaptureMode EffectiveHudAntiCaptureMode => ProtectionLevel switch
+    private AntiCaptureMode EffectiveSoftwareAntiCaptureMode => ProtectionLevel switch
     {
         CaptureProtectionLevel.Software => _settings.AntiCapture,
         _ => AntiCaptureMode.Off
     };
     private void ApplyEffectiveCaptureProtection(bool requireKernel = false)
     {
-        _overlayHost.SetAntiCaptureModes(EffectiveOverlayAntiCaptureMode, EffectiveHudAntiCaptureMode);
+        _overlayHost.SetAntiCaptureModes(EffectiveSoftwareAntiCaptureMode, EffectiveSoftwareAntiCaptureMode);
+        WindowCaptureProtection.ApplyToHandle(
+            _settingsWindowHandle,
+            EffectiveSoftwareAntiCaptureMode,
+            nameof(SettingsWindow));
         if (ProtectionLevel != CaptureProtectionLevel.Kernel) return;
 
         try
@@ -360,13 +365,15 @@ internal sealed class AppState : IDisposable
     {
         var windows = _overlayHost.InspectAntiCapture();
         var gpu = GpuOutputStatus;
-        var windowVerified = windows.Overlay.Verified && windows.Hud.Verified;
+        var settingsAffinity = ReadDisplayAffinity(_settingsWindowHandle);
+        var expectedSettingsAffinity = WindowCaptureProtection.GetExpectedAffinity(EffectiveSoftwareAntiCaptureMode, out _);
+        var settingsVerified = settingsAffinity.Success && settingsAffinity.Value == expectedSettingsAffinity;
+        var windowVerified = windows.Overlay.Verified && windows.Hud.Verified && settingsVerified;
         var actual = $"Overlay {windows.Overlay.ActualLabel} / HUD {windows.Hud.ActualLabel}";
         var offModesMatch = windows.Overlay.Requested == AntiCaptureMode.Off && windows.Hud.Requested == AntiCaptureMode.Off;
         var softwareModesMatch = windows.Overlay.Requested == _settings.AntiCapture && windows.Hud.Requested == _settings.AntiCapture;
         var hardwareModesMatch = windows.Overlay.Requested == AntiCaptureMode.Off && windows.Hud.Requested == AntiCaptureMode.Off;
-        var requested = $"requested Overlay {windows.Overlay.Requested} / HUD {windows.Hud.Requested}";
-        var settingsAffinity = ReadDisplayAffinity(_settingsWindowHandle);
+        var requested = $"requested Overlay {windows.Overlay.Requested} / HUD {windows.Hud.Requested} / Settings {EffectiveSoftwareAntiCaptureMode}";
         var affinityLabel = $"Affinity: Overlay {windows.Overlay.ActualLabel} | HUD {windows.Hud.ActualLabel} | Settings {settingsAffinity.Label}";
         if (ProtectionLevel == CaptureProtectionLevel.Kernel && !string.Equals(_lastKernelAffinityLog, affinityLabel, StringComparison.Ordinal))
         {

@@ -3,6 +3,7 @@
 **/bin/
 **/obj/
 publish/
+**/publish*/
 CaptureDiagnostics/
 **/x64/
 TestResults/

@@ -40,28 +40,33 @@ internal sealed class WindowCaptureProtection
 
     private void Apply()
     {
-        // Older Windows silently treats Exclude as Black; report that fallback.
-        var affinity = GetExpectedAffinity(_mode, out var excludeUnavailable);
-        if (!NativeMethods.SetWindowDisplayAffinity(_window.Handle, affinity))
-        {
-            Fail($"Failed (Win32 {Marshal.GetLastWin32Error()})");
-            return;
-        }
-        if (!NativeMethods.GetWindowDisplayAffinity(_window.Handle, out var actual))
-        {
-            Fail($"Unverified (Win32 {Marshal.GetLastWin32Error()})");
-            return;
-        }
-        if (actual != affinity)
-        {
-            Fail($"Mismatch (0x{actual:X})");
-            return;
-        }
-        _status = excludeUnavailable ? "Black (Exclude requires Windows 10 2004+)" : _mode.ToString();
-        Logger.Debug($"Anti-Capture {_window.GetType().Name}: {_status}, affinity=0x{actual:X}");
+        var state = ApplyToHandle(_window.Handle, _mode, _window.GetType().Name);
+        _status = state.Verified
+            ? state.Requested.ToString()
+            : state.Detail;
     }
 
-    private static uint GetExpectedAffinity(AntiCaptureMode mode, out bool excludeUnavailable)
+    internal static WindowCaptureState ApplyToHandle(IntPtr handle, AntiCaptureMode mode, string targetName)
+    {
+        mode = Enum.IsDefined(mode) ? mode : AntiCaptureMode.Off;
+        var expected = GetExpectedAffinity(mode, out var excludeUnavailable);
+        if (handle == IntPtr.Zero || !NativeMethods.IsWindow(handle))
+            return new(mode, expected, 0, false, "No window handle");
+        if (!NativeMethods.SetWindowDisplayAffinity(handle, expected))
+            return Failure(mode, expected, $"Failed (Win32 {Marshal.GetLastWin32Error()})", targetName);
+        if (!NativeMethods.GetWindowDisplayAffinity(handle, out var actual))
+            return Failure(mode, expected, $"Unverified (Win32 {Marshal.GetLastWin32Error()})", targetName);
+        if (actual != expected)
+            return Failure(mode, expected, $"Mismatch (0x{actual:X})", targetName, actual);
+
+        var detail = excludeUnavailable
+            ? "Black (Exclude requires Windows 10 2004+)"
+            : $"verified 0x{actual:X}";
+        Logger.Debug($"Anti-Capture {targetName}: {mode}, affinity=0x{actual:X}");
+        return new(mode, expected, actual, true, detail);
+    }
+
+    internal static uint GetExpectedAffinity(AntiCaptureMode mode, out bool excludeUnavailable)
     {
         excludeUnavailable = mode == AntiCaptureMode.Exclude && !OperatingSystem.IsWindowsVersionAtLeast(10, 0, 19041);
         return mode switch
@@ -73,10 +78,15 @@ internal sealed class WindowCaptureProtection
         };
     }
 
-    private void Fail(string status)
+    private static WindowCaptureState Failure(
+        AntiCaptureMode mode,
+        uint expected,
+        string detail,
+        string targetName,
+        uint actual = 0)
     {
-        _status = status;
-        Logger.Error($"Anti-Capture {_window.GetType().Name}: requested {_mode}; {status}");
+        Logger.Error($"Anti-Capture {targetName}: requested {mode}; {detail}");
+        return new(mode, expected, actual, false, detail);
     }
 }
 
