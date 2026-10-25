@@ -157,6 +157,12 @@ internal sealed class SettingsWindow : Form
         _controller?.Resize(ClientSize.Width, ClientSize.Height);
     }
 
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!e.Cancel) GpuScanoutProtection.RestoreBeforeExit();
+        base.OnFormClosing(e);
+    }
+
     protected override void OnPaint(PaintEventArgs e) => _controller?.Render(DrawUi);
 
     protected override void OnPaintBackground(PaintEventArgs e)

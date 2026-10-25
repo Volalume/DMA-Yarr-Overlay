@@ -4,8 +4,11 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Media;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Windows.Forms;
 
 namespace Overlay;
 
@@ -14,6 +17,7 @@ internal static class GpuScanoutProtection
     private const string HelperArgument = "--gpu-scanout-helper";
     private const string AdministratorsSid = "*S-1-5-32-544";
     private static string? _helperBackupDirectory;
+    private static string? _watchdogSignalPath;
 
     public static string SystemDllPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.System), "nvapi64.dll");
@@ -44,10 +48,26 @@ internal static class GpuScanoutProtection
 
     public static void SetEnabled(bool enabled)
     {
+        if (!enabled && RequestWatchdogRestore("manual", TimeSpan.FromSeconds(10)))
+        {
+            Logger.Info("GPU scanout capture protection disabled by the elevated restore watchdog.");
+            return;
+        }
+
         AppPaths.EnsureDataDirectory();
         var resultPath = Path.Combine(AppPaths.DataDirectory, $"gpu-scanout-{Guid.NewGuid():N}.result");
+        var signalPath = enabled
+            ? Path.Combine(AppPaths.DataDirectory, $"gpu-scanout-{Environment.ProcessId}.restore")
+            : "-";
+        var completed = false;
         try
         {
+            if (enabled)
+            {
+                try { if (File.Exists(signalPath)) File.Delete(signalPath); } catch { }
+                _watchdogSignalPath = signalPath;
+            }
+
             var executable = Environment.ProcessPath
                 ?? throw new InvalidOperationException("Current executable path is unavailable.");
             var start = new ProcessStartInfo(executable)
@@ -59,18 +79,21 @@ internal static class GpuScanoutProtection
             start.ArgumentList.Add(enabled ? "enable" : "disable");
             start.ArgumentList.Add(resultPath);
             start.ArgumentList.Add(BackupDirectory);
+            start.ArgumentList.Add(Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+            start.ArgumentList.Add(signalPath);
 
             using var process = Process.Start(start)
                 ?? throw new InvalidOperationException("The elevated protection helper did not start.");
-            if (!process.WaitForExit(120_000))
-                throw new TimeoutException("The elevated protection helper did not finish within two minutes.");
-
-            var result = File.Exists(resultPath) ? File.ReadAllText(resultPath).Trim() : "No result was returned.";
-            if (process.ExitCode != 0)
-                throw new InvalidOperationException(result);
+            var result = WaitForHelperResult(process, resultPath, TimeSpan.FromMinutes(2));
+            if (result.StartsWith("ERROR|", StringComparison.Ordinal))
+                throw new InvalidOperationException(result[6..]);
+            if (!result.StartsWith("OK|", StringComparison.Ordinal))
+                throw new InvalidOperationException($"Invalid helper response: {result}");
+            result = result[3..];
             if (enabled != IsActive)
                 throw new InvalidOperationException($"The requested state was not verified. {result}");
 
+            completed = true;
             Logger.Info($"GPU scanout capture protection {(enabled ? "enabled" : "disabled")}: {result}");
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
@@ -80,7 +103,74 @@ internal static class GpuScanoutProtection
         finally
         {
             try { if (File.Exists(resultPath)) File.Delete(resultPath); } catch { }
+            if (enabled && !completed)
+            {
+                try { if (File.Exists(signalPath)) File.Delete(signalPath); } catch { }
+                _watchdogSignalPath = null;
+            }
         }
+    }
+
+    public static void RestoreBeforeExit()
+    {
+        if (!IsActive) return;
+        if (!RequestWatchdogRestore("exit", TimeSpan.FromSeconds(8)))
+            Logger.Error("The GPU scanout restore watchdog did not confirm restoration before exit.");
+    }
+
+    private static bool RequestWatchdogRestore(string reason, TimeSpan timeout)
+    {
+        var signalPath = _watchdogSignalPath;
+        if (!IsActive)
+        {
+            _watchdogSignalPath = null;
+            return true;
+        }
+        if (string.IsNullOrWhiteSpace(signalPath)) return false;
+
+        try { File.WriteAllText(signalPath, reason); }
+        catch (Exception ex)
+        {
+            Logger.Error($"Could not signal the GPU scanout restore watchdog: {ex.Message}");
+            return false;
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < timeout)
+        {
+            if (!IsActive)
+            {
+                _watchdogSignalPath = null;
+                return true;
+            }
+            Thread.Sleep(50);
+        }
+        return !IsActive;
+    }
+
+    private static string WaitForHelperResult(Process process, string resultPath, TimeSpan timeout)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < timeout)
+        {
+            try
+            {
+                if (File.Exists(resultPath))
+                {
+                    var result = File.ReadAllText(resultPath).Trim();
+                    if (!string.IsNullOrWhiteSpace(result)) return result;
+                }
+            }
+            catch (IOException)
+            {
+                // The helper may still be completing its atomic write.
+            }
+
+            if (process.HasExited)
+                throw new InvalidOperationException($"The elevated helper exited without a result (code {process.ExitCode}).");
+            Thread.Sleep(50);
+        }
+        throw new TimeoutException("The elevated protection helper did not respond within two minutes.");
     }
 
     public static bool TryRunHelper(string[] args, out int exitCode)
@@ -92,25 +182,206 @@ internal static class GpuScanoutProtection
         var resultPath = args.Length >= 4 ? args[3] : "";
         try
         {
-            if (args.Length != 5 ||
+            if (args.Length != 7 ||
                 (!args[2].Equals("enable", StringComparison.OrdinalIgnoreCase) &&
                  !args[2].Equals("disable", StringComparison.OrdinalIgnoreCase)))
                 throw new ArgumentException("Invalid GPU scanout helper arguments.");
             if (string.IsNullOrWhiteSpace(resultPath))
                 throw new ArgumentException("The helper result path is missing.");
             _helperBackupDirectory = Path.GetFullPath(args[4]);
+            if (!int.TryParse(args[5], NumberStyles.None, CultureInfo.InvariantCulture, out var parentProcessId) || parentProcessId <= 0)
+                throw new ArgumentException("The parent process ID is invalid.");
 
-            var message = args[2].Equals("enable", StringComparison.OrdinalIgnoreCase)
+            var enable = args[2].Equals("enable", StringComparison.OrdinalIgnoreCase);
+            var message = enable
                 ? EnableElevated()
                 : DisableElevated();
-            WriteResult(resultPath, message);
+            WriteResult(resultPath, $"OK|{message}");
+            if (enable) WatchParentAndRestore(parentProcessId, args[6]);
         }
         catch (Exception ex)
         {
             exitCode = 1;
-            WriteResult(resultPath, $"{ex.GetType().Name}: {ex.Message}");
+            WriteResult(resultPath, $"ERROR|{ex.GetType().Name}: {ex.Message}");
         }
         return true;
+    }
+
+    private static void WatchParentAndRestore(int parentProcessId, string signalPath)
+    {
+        // The main app uses the normal shutdown priority. Keeping this helper at a
+        // lower priority lets it restore NVAPI after the app exits during shutdown.
+        SetProcessShutdownParameters(0x100, 0);
+        var reason = "process-exit";
+        try
+        {
+            Process? parent = null;
+            try { parent = Process.GetProcessById(parentProcessId); }
+            catch (ArgumentException) { }
+
+            using (parent)
+            {
+                while (parent is { HasExited: false })
+                {
+                    if (File.Exists(SystemDllPath)) return;
+                    if (File.Exists(signalPath))
+                    {
+                        try { reason = File.ReadAllText(signalPath).Trim(); } catch { }
+                        break;
+                    }
+                    parent.WaitForExit(250);
+                }
+            }
+
+            if (File.Exists(SystemDllPath)) return;
+            var message = DisableElevated();
+            Logger.Info($"Automatic NVAPI restore completed ({reason}): {message}");
+            if (!string.Equals(reason, "manual", StringComparison.OrdinalIgnoreCase))
+                ShowRestoreNotification(true, "NVIDIA NVAPI was restored automatically.");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Automatic NVAPI restore failed: {ex}");
+            ShowRestoreNotification(false, $"Automatic NVAPI restore failed: {ex.Message}");
+        }
+        finally
+        {
+            try { if (File.Exists(signalPath)) File.Delete(signalPath); } catch { }
+        }
+    }
+
+    private static void ShowRestoreNotification(bool success, string message)
+    {
+        try
+        {
+            if (success) SystemSounds.Asterisk.Play();
+            else SystemSounds.Hand.Play();
+            using var customIcon = LoadNotificationIcon();
+            if (customIcon is not null && ShowNativeBalloon(customIcon, success, message)) return;
+
+            using var notification = new NotifyIcon
+            {
+                Icon = System.Drawing.SystemIcons.Shield,
+                Visible = true,
+                BalloonTipTitle = success ? "YarrOverlay protection restored" : "YarrOverlay restore failed",
+                BalloonTipText = message,
+                BalloonTipIcon = ToolTipIcon.None
+            };
+            notification.ShowBalloonTip(3000);
+            Thread.Sleep(1200);
+        }
+        catch
+        {
+            MessageBeep(success ? 0x40u : 0x10u);
+        }
+    }
+
+    private static bool ShowNativeBalloon(System.Drawing.Icon icon, bool success, string message)
+    {
+        const uint NotifyIconAdd = 0x00000000;
+        const uint NotifyIconModify = 0x00000001;
+        const uint NotifyIconDelete = 0x00000002;
+        const uint NotifyIconSetVersion = 0x00000004;
+        const uint NotifyIconVersion4 = 4;
+        const uint NotifyIconFlagMessage = 0x00000001;
+        const uint NotifyIconFlagIcon = 0x00000002;
+        const uint NotifyIconFlagTip = 0x00000004;
+        const uint NotifyIconFlagInfo = 0x00000010;
+        const uint NotifyInfoUser = 0x00000004;
+        const uint NotifyInfoLargeIcon = 0x00000020;
+
+        using var window = new NotificationMessageWindow();
+        var data = new NativeNotifyIconData
+        {
+            Size = (uint)Marshal.SizeOf<NativeNotifyIconData>(),
+            WindowHandle = window.Handle,
+            Id = 1,
+            Flags = NotifyIconFlagMessage | NotifyIconFlagIcon | NotifyIconFlagTip,
+            CallbackMessage = 0x8000 + 77,
+            IconHandle = System.Drawing.SystemIcons.Shield.Handle,
+            Tip = "YarrOverlay",
+            Info = "",
+            InfoTitle = ""
+        };
+        if (!ShellNotifyIcon(NotifyIconAdd, ref data)) return false;
+
+        try
+        {
+            data.TimeoutOrVersion = NotifyIconVersion4;
+            ShellNotifyIcon(NotifyIconSetVersion, ref data);
+            data.Flags = NotifyIconFlagInfo;
+            data.Info = message;
+            data.InfoTitle = success ? "YarrOverlay protection restored" : "YarrOverlay restore failed";
+            data.InfoFlags = NotifyInfoUser | NotifyInfoLargeIcon;
+            data.BalloonIconHandle = icon.Handle;
+            data.TimeoutOrVersion = 3000;
+            if (!ShellNotifyIcon(NotifyIconModify, ref data)) return false;
+            Thread.Sleep(1800);
+            return true;
+        }
+        finally
+        {
+            data.Flags = 0;
+            ShellNotifyIcon(NotifyIconDelete, ref data);
+        }
+    }
+
+    private static System.Drawing.Icon? LoadNotificationIcon()
+    {
+        try
+        {
+            using var stream = typeof(GpuScanoutProtection).Assembly
+                .GetManifestResourceStream("Overlay.NotificationIcon.ico");
+            if (stream is null) return null;
+            using var icon = new System.Drawing.Icon(stream);
+            return (System.Drawing.Icon)icon.Clone();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct NativeNotifyIconData
+    {
+        public uint Size;
+        public IntPtr WindowHandle;
+        public uint Id;
+        public uint Flags;
+        public uint CallbackMessage;
+        public IntPtr IconHandle;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string Tip;
+
+        public uint State;
+        public uint StateMask;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string Info;
+
+        public uint TimeoutOrVersion;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string InfoTitle;
+
+        public uint InfoFlags;
+        public Guid ItemGuid;
+        public IntPtr BalloonIconHandle;
+    }
+
+    private sealed class NotificationMessageWindow : NativeWindow, IDisposable
+    {
+        public NotificationMessageWindow()
+        {
+            CreateHandle(new CreateParams { Caption = "YarrOverlay Notification" });
+        }
+
+        public void Dispose()
+        {
+            if (Handle != IntPtr.Zero) DestroyHandle();
+        }
     }
 
     private static string EnableElevated()
@@ -125,10 +396,52 @@ internal static class GpuScanoutProtection
         }
 
         EnsureSameVolume(source, backup);
-        if (File.Exists(backup)) File.Delete(backup);
-        CreateHardLinkChecked(backup, source);
+        var reusedBackup = File.Exists(backup) && FilesMatch(backup, source);
+        if (!reusedBackup)
+        {
+            if (File.Exists(backup)) DeleteBackupForReplacement(backup);
+            CreateHardLinkChecked(backup, source);
+        }
         ForceDelete(source);
-        return "Linked nvapi64.dll into Backup and removed the System32 link.";
+        return reusedBackup
+            ? "Reused the existing NVAPI backup and removed the System32 link."
+            : "Linked nvapi64.dll into Backup and removed the System32 link.";
+    }
+
+    private static bool FilesMatch(string firstPath, string secondPath)
+    {
+        try
+        {
+            var first = new FileInfo(firstPath);
+            var second = new FileInfo(secondPath);
+            if (first.Length != second.Length) return false;
+            return string.Equals(
+                FileVersionInfo.GetVersionInfo(firstPath).FileVersion,
+                FileVersionInfo.GetVersionInfo(secondPath).FileVersion,
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void DeleteBackupForReplacement(string path)
+    {
+        try
+        {
+            File.Delete(path);
+            return;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // A restored DriverStore hard link may retain its protected ACL.
+        }
+
+        RunSystemTool("takeown.exe", "/f", path);
+        RunSystemTool("icacls.exe", path, "/grant", $"{AdministratorsSid}:F");
+        File.SetAttributes(path, FileAttributes.Normal);
+        File.Delete(path);
     }
 
     private static string DisableElevated()
@@ -382,4 +695,16 @@ internal static class GpuScanoutProtection
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool FreeLibrary(IntPtr module);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetProcessShutdownParameters(uint level, uint flags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MessageBeep(uint type);
+
+    [DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShellNotifyIcon(uint message, ref NativeNotifyIconData data);
 }

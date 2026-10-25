@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <AssemblyName>Overlay</AssemblyName>
+    <AssemblyName>YarrOverlay</AssemblyName>
     <Product>Overlay</Product>
     <AssemblyTitle>Overlay</AssemblyTitle>
     <Description>Overlay</Description>
@@ -24,6 +24,7 @@
     <PublishDir>$(MSBuildProjectDirectory)\bin\Release\single-file\</PublishDir>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="Assets\NotificationIcon.ico" LogicalName="Overlay.NotificationIcon.ico" />
     <PackageReference Include="Hexa.NET.ImGui.Backends" Version="1.0.18" />
     <PackageReference Include="TerraFX.Interop.Windows" Version="10.0.26100.6" />
     <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
