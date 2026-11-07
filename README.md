@@ -90,7 +90,8 @@ Open **Settings → Anti-Capture** and select one level:
 - **Off:** normal capture behavior.
 - **Software Level:** uses Windows display affinity for both the output overlay and latency HUD. `Black` returns a black protected region in supported capture paths; `Exclude` omits the protected windows so the desktop underneath can remain visible.
 - **Hardware Level:** experimental. Requires `Auto` or `GPU Native`, both displays on the same GPU, and compatible WDDM/GPU drivers. It combines verified `Black` window affinity with a `HW_PROTECTED | DISPLAY_ONLY` GPU swap chain. Its source uses Windows Graphics Capture instead of Desktop Duplication to avoid Parsec/VDD invalidation. It never falls back to an unprotected or CPU path while selected.
-- **Kernel Level:** reserved in the UI and not implemented.
+- **Kernel Level:** By mapping the kernel driver, it hooks Windows' `GetWindowDisplayAffinity` function. While this prevents external programs—including anti-cheat software—from detecting the capture flag, it does not improve protection.
+- **GPU Scanout Capture Protection:** This is specifically designed for AC that captures the GPU's framebuffer via NVIDIA drivers(such as VGK), ``it temporarily isolates driver from the directory`` to disable the capture. (It is automatically restored upon exit, and has been confirmed not to affect performance.)
 
 > **Recommendation:** Hardware Level may introduce noticeably higher latency because it uses a different protected capture path. For normal use, **Software Level + Exclude** is recommended when it provides enough protection for your setup.
 
