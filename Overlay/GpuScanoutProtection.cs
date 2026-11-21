@@ -395,17 +395,19 @@ internal static class GpuScanoutProtection
             throw new FileNotFoundException("The NVIDIA NVAPI DLL was not found in System32.", source);
         }
 
-        EnsureSameVolume(source, backup);
         var reusedBackup = File.Exists(backup) && FilesMatch(backup, source);
+        var linkedBackup = true;
         if (!reusedBackup)
         {
             if (File.Exists(backup)) DeleteBackupForReplacement(backup);
-            CreateHardLinkChecked(backup, source);
+            linkedBackup = CreateHardLinkOrCopy(backup, source);
         }
         ForceDelete(source);
         return reusedBackup
             ? "Reused the existing NVAPI backup and removed the System32 link."
-            : "Linked nvapi64.dll into Backup and removed the System32 link.";
+            : linkedBackup
+                ? "Linked nvapi64.dll into Backup and removed the System32 link."
+                : "Copied nvapi64.dll into Backup and removed the System32 file.";
     }
 
     private static bool FilesMatch(string firstPath, string secondPath)
@@ -453,8 +455,8 @@ internal static class GpuScanoutProtection
         if (File.Exists(source)) return "nvapi64.dll is already present in System32.";
 
         var restoreSource = FindDriverStoreSource(backup) ?? backup;
-        EnsureSameVolume(restoreSource, source);
-        CreateHardLinkChecked(source, restoreSource);
+        var linkedRestore = CreateHardLinkOrCopy(source, restoreSource);
+        if (!linkedRestore) return "Restored nvapi64.dll to System32 from a file copy.";
         return restoreSource.Equals(backup, StringComparison.OrdinalIgnoreCase)
             ? "Restored the System32 link from Backup."
             : "Restored the original DriverStore link to System32.";
@@ -488,19 +490,24 @@ internal static class GpuScanoutProtection
         }
     }
 
-    private static void EnsureSameVolume(string existingPath, string newPath)
+    private static bool CreateHardLinkOrCopy(string newPath, string existingPath)
     {
-        var existingRoot = Path.GetPathRoot(Path.GetFullPath(existingPath));
-        var newRoot = Path.GetPathRoot(Path.GetFullPath(newPath));
-        if (!string.Equals(existingRoot, newRoot, StringComparison.OrdinalIgnoreCase))
-            throw new IOException("Backup and System32 must be on the same NTFS volume.");
-    }
+        if (CreateHardLink(newPath, existingPath, IntPtr.Zero)) return true;
 
-    private static void CreateHardLinkChecked(string newPath, string existingPath)
-    {
-        if (CreateHardLink(newPath, existingPath, IntPtr.Zero)) return;
-        throw new Win32Exception(Marshal.GetLastWin32Error(),
-            $"Could not create the NVAPI hard link: {newPath}");
+        var hardLinkError = Marshal.GetLastWin32Error();
+        try
+        {
+            File.Copy(existingPath, newPath, overwrite: false);
+            Logger.Info($"NVAPI hard-link creation failed with Win32 {hardLinkError}; used a file copy instead.");
+            return false;
+        }
+        catch (Exception copyError) when (copyError is IOException or UnauthorizedAccessException)
+        {
+            throw new IOException(
+                $"Could not create the NVAPI destination. Hard link failed with Win32 {hardLinkError}: " +
+                $"{new Win32Exception(hardLinkError).Message}. File copy also failed: {copyError.Message}",
+                copyError);
+        }
     }
 
     private static void ForceDelete(string path)

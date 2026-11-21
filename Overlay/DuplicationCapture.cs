@@ -114,7 +114,7 @@ internal sealed class DuplicationCapture : IDisposable
                             accumulatedFrames = (int)frameInfo.AccumulatedFrames; desktopPresentTime = frameInfo.LastPresentTime; desktopMouseUpdateTime = frameInfo.LastMouseUpdateTime; metadataSize = frameInfo.TotalMetadataBufferSize; pointerVisible = frameInfo.PointerPosition.Visible; protectedMaskedOut = frameInfo.ProtectedContentMaskedOut;
                             if (result.Failure)
                             {
-                                if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { if(collectMetrics)_metrics.RecordTimeout(); spin.SpinOnce(); continue; }
+                                if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { if(collectMetrics)_metrics.RecordTimeout(); spin.SpinOnce(sleep1Threshold: -1); continue; }
                                 if(collectMetrics)_metrics.RecordDxgiError();
                                 failures++; var error = $"AcquireNextFrame failed: 0x{result.Code:X8}"; lastError = error;
                                 var sinceLoss = lastLossTick == 0 ? -1 : FrameTiming.Ms(lastLossTick, FrameTiming.Now);
