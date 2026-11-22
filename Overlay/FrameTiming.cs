@@ -77,21 +77,37 @@ internal sealed class LatencyMetrics
     }
     public PerformanceSnapshot Snapshot()
     {
-        MetricSample[] copy; long[] captures; lock (_sync) { copy = new MetricSample[_count]; for (var i = 0; i < _count; i++) copy[i] = _samples[(_write - _count + i + Capacity) % Capacity]; captures=new long[_captureCount];for(var i=0;i<_captureCount;i++)captures[i]=_captureTimestamps[(_captureWrite-_captureCount+i+Capacity)%Capacity]; }
         var now = FrameTiming.Now;
         var oneCutoff=now-Stopwatch.Frequency;var tenCutoff=now-Stopwatch.Frequency*10L;
+        MetricSample[] copy; long[] captures; WindowPerformance session;
+        lock (_sync)
+        {
+            // Only the 10 s window is analysed; the whole-session view comes from the histograms.
+            copy = CopyNewest(_samples, _write, _count, tenCutoff, static s => s.Timestamp);
+            captures = CopyNewest(_captureTimestamps, _captureWrite, _captureCount, tenCutoff, static t => t);
+            var sessionSeconds=Math.Max(0.001,FrameTiming.Ms(_sessionStart,now)/1000.0);
+            session = _session.Describe(sessionSeconds,Volatile.Read(ref _captured)/sessionSeconds);
+        }
         var one = DescribeWindow(copy, oneCutoff) with { CaptureFps=CaptureRate(captures,oneCutoff,now) };
         var ten = DescribeWindow(copy, tenCutoff) with { CaptureFps=CaptureRate(captures,tenCutoff,now) };
-        var sessionSeconds=Math.Max(0.001,FrameTiming.Ms(_sessionStart,now)/1000.0);
-        WindowPerformance session; lock (_sync) session = _session.Describe(sessionSeconds,Volatile.Read(ref _captured)/sessionSeconds);
         return new PerformanceSnapshot(Volatile.Read(ref _captured), Volatile.Read(ref _submitted), Volatile.Read(ref _replaced), Volatile.Read(ref _dropped), Volatile.Read(ref _timeouts), Volatile.Read(ref _dxgiErrors), Volatile.Read(ref _accumulated), Volatile.Read(ref _maxAccumulated), (int)Volatile.Read(ref _queueLength), Volatile.Read(ref _maxQueue), one, ten, session);
+    }
+    // Rings are written in time order, so the samples newer than the cutoff are a contiguous tail.
+    private static T[] CopyNewest<T>(T[] ring, int write, int count, long cutoff, Func<T,long> timestamp)
+    {
+        var n = 0;
+        while (n < count && timestamp(ring[(write - 1 - n + Capacity) % Capacity]) >= cutoff) n++;
+        var copy = new T[n];
+        for (var i = 0; i < n; i++) copy[i] = ring[(write - n + i + Capacity) % Capacity];
+        return copy;
     }
     private static double CaptureRate(long[] timestamps,long cutoff,long now){var start=0;while(start<timestamps.Length&&timestamps[start]<cutoff)start++;if(start==timestamps.Length)return 0;var duration=Math.Max(.001,FrameTiming.Ms(Math.Max(cutoff,timestamps[start]),now)/1000.0);return (timestamps.Length-start)/duration;}
     private static WindowPerformance DescribeWindow(MetricSample[] samples, long cutoff)
     {
         var start = 0; while (start < samples.Length && samples[start].Timestamp < cutoff) start++;
         var count = samples.Length - start; if (count <= 0) return WindowPerformance.Empty;
-        TimingStats D(Func<MetricSample,double> selector) { var values = new double[count]; var valid = 0; for (var i=start;i<samples.Length;i++){var v=selector(samples[i]);if(!double.IsNaN(v))values[valid++]=v;} return Describe(values, valid); }
+        var values = new double[count];
+        TimingStats D(Func<MetricSample,double> selector) { var valid = 0; for (var i=start;i<samples.Length;i++){var v=selector(samples[i]);if(!double.IsNaN(v))values[valid++]=v;} return Describe(values, valid); }
         var duration = Math.Max(0.001, FrameTiming.Ms(samples[start].Timestamp, FrameTiming.Now) / 1000.0);
         return new WindowPerformance(0, count / duration, D(x=>x.Pipeline), D(x=>x.DesktopToSubmit), D(x=>x.AcquireWait), D(x=>x.MapWait), D(x=>x.CpuCopy), D(x=>x.UiQueue), D(x=>x.HBitmap), D(x=>x.Submit), D(x=>x.FrameAge), D(x=>x.FrameInterval), D(x=>x.GpuCopy), D(x=>x.GpuShader), D(x=>x.GpuTotal));
     }
@@ -121,7 +137,21 @@ internal sealed class LatencyMetrics
         private readonly long[] _bins=new long[Buckets]; private long _count; private double _sum, _min=double.PositiveInfinity, _max=double.NegativeInfinity, _current=double.NaN;
         public void Reset(){Array.Clear(_bins);_count=0;_sum=0;_min=double.PositiveInfinity;_max=double.NegativeInfinity;_current=double.NaN;}
         public void Add(double value){if(double.IsNaN(value)||double.IsInfinity(value))return;_current=value;_count++;_sum+=value;_min=Math.Min(_min,value);_max=Math.Max(_max,value);var bucket=Math.Clamp((int)(Math.Max(0,value)/Width),0,Buckets-1);_bins[bucket]++;}
-        public TimingStats Describe(){if(_count==0)return TimingStats.Empty;double P(double p){var target=(long)Math.Ceiling(_count*p);long seen=0;for(var i=0;i<Buckets;i++){seen+=_bins[i];if(seen>=target)return i*Width;}return _max;}return new(_current,_sum/_count,_min,_max,P(.5),P(.95),P(.99));}
+        public TimingStats Describe()
+        {
+            if(_count==0)return TimingStats.Empty;
+            long t50=(long)Math.Ceiling(_count*.5), t95=(long)Math.Ceiling(_count*.95), t99=(long)Math.Ceiling(_count*.99);
+            double p50=_max, p95=_max, p99=_max; long seen=0;
+            for(var i=0;i<Buckets;i++)
+            {
+                if(_bins[i]==0)continue;
+                var before=seen; seen+=_bins[i];
+                if(before<t50&&seen>=t50)p50=i*Width;
+                if(before<t95&&seen>=t95)p95=i*Width;
+                if(seen>=t99){p99=i*Width;break;}
+            }
+            return new(_current,_sum/_count,_min,_max,p50,p95,p99);
+        }
     }
 }
 internal sealed record TimingStats(double Current, double Average, double Minimum, double Maximum, double P50, double P95, double P99)

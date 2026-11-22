@@ -1,5 +1,7 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using TerraFX.Interop.Windows;
 using TerraWinRT = TerraFX.Interop.WinRT.WinRT;
 using TerraHString = TerraFX.Interop.WinRT.HSTRING;
@@ -13,6 +15,7 @@ using WinRtDirect3DDevice = Windows.Graphics.DirectX.Direct3D11.IDirect3DDevice;
 using WinRtDirect3DSurface = Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface;
 using WinRtCaptureItem = Windows.Graphics.Capture.GraphicsCaptureItem;
 using WinRtCaptureFramePool = Windows.Graphics.Capture.Direct3D11CaptureFramePool;
+using WinRtCaptureFrame = Windows.Graphics.Capture.Direct3D11CaptureFrame;
 using WinRtCaptureSession = Windows.Graphics.Capture.GraphicsCaptureSession;
 using WinRtPixelFormat = Windows.Graphics.DirectX.DirectXPixelFormat;
 
@@ -32,6 +35,7 @@ internal sealed unsafe class GraphicsCaptureSource : IDisposable
     private readonly WinRtDirect3DDevice _winrtDevice;
     private readonly WinRtCaptureFramePool _framePool;
     private readonly WinRtCaptureSession _session;
+    private readonly AutoResetEvent _frameArrived = new(false);
     private bool _disposed;
 
     private GraphicsCaptureSource(WinRtCaptureItem item, WinRtDirect3DDevice winrtDevice, WinRtCaptureFramePool framePool, WinRtCaptureSession session)
@@ -40,7 +44,14 @@ internal sealed unsafe class GraphicsCaptureSource : IDisposable
         _winrtDevice = winrtDevice;
         _framePool = framePool;
         _session = session;
+        // Free-threaded pools raise this on a system worker thread; subscribe
+        // before StartCapture so the first frame is not missed.
+        _framePool.FrameArrived += OnFrameArrived;
     }
+
+    private void OnFrameArrived(WinRtCaptureFramePool sender, object args) => _frameArrived.Set();
+
+    public bool WaitForFrame(uint timeoutMs) => _frameArrived.WaitOne((int)timeoutMs);
 
     public static GraphicsCaptureSource Create(ID3D11Device device, MonitorInfo monitor)
     {
@@ -65,8 +76,9 @@ internal sealed unsafe class GraphicsCaptureSource : IDisposable
                     try
                     {
                         session.IsCursorCaptureEnabled = true;
+                        var source = new GraphicsCaptureSource(item, winrtDevice, pool, session);
                         session.StartCapture();
-                        return new GraphicsCaptureSource(item, winrtDevice, pool, session);
+                        return source;
                     }
                     catch { session.Dispose(); throw; }
                 }
@@ -77,11 +89,37 @@ internal sealed unsafe class GraphicsCaptureSource : IDisposable
         catch { throw; }
     }
 
-    public VorticeTexture2D? TryGetNextTexture()
+    // The pool queues frames in arrival order. Only the newest one is useful, so
+    // older queued frames are returned to the pool instead of being rendered late.
+    // The returned frame keeps its pool buffer reserved until the caller disposes it,
+    // which must happen only after the GPU copy out of it has been submitted.
+    public GraphicsCaptureFrame? TryGetLatestFrame()
     {
-        using var frame = _framePool.TryGetNextFrame();
-        if (frame is null) return null;
-        var surface = frame.Surface;
+        var latest = _framePool.TryGetNextFrame();
+        if (latest is null) return null;
+        for (var newer = _framePool.TryGetNextFrame(); newer is not null; newer = _framePool.TryGetNextFrame())
+        {
+            latest.Dispose();
+            latest = newer;
+        }
+        WinRtDirect3DSurface? surface = null;
+        try
+        {
+            // SystemRelativeTime is the QPC time DWM composed the frame, in 100 ns units.
+            var presentQpc = (long)((Int128)latest.SystemRelativeTime.Ticks * Stopwatch.Frequency / TimeSpan.TicksPerSecond);
+            surface = latest.Surface;
+            return new GraphicsCaptureFrame(latest, surface, GetTexture(surface), presentQpc);
+        }
+        catch
+        {
+            surface?.Dispose();
+            latest.Dispose();
+            throw;
+        }
+    }
+
+    private static VorticeTexture2D GetTexture(WinRtDirect3DSurface surface)
+    {
         // Use the C#/WinRT native object reference. Marshal.GetIUnknownForObject
         // can return the projection identity rather than the underlying WinRT ABI
         // pointer, which makes IDirect3DDxgiInterfaceAccess appear unavailable.
@@ -137,8 +175,30 @@ internal sealed unsafe class GraphicsCaptureSource : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _framePool.FrameArrived -= OnFrameArrived;
         _session.Dispose();
         _framePool.Dispose();
+        _frameArrived.Dispose();
+    }
+}
+
+internal sealed class GraphicsCaptureFrame : IDisposable
+{
+    private readonly WinRtCaptureFrame _frame;
+    private readonly WinRtDirect3DSurface _surface;
+    public VorticeTexture2D Texture { get; }
+    public long PresentQpc { get; }
+
+    public GraphicsCaptureFrame(WinRtCaptureFrame frame, WinRtDirect3DSurface surface, VorticeTexture2D texture, long presentQpc)
+    {
+        _frame = frame; _surface = surface; Texture = texture; PresentQpc = presentQpc;
+    }
+
+    public void Dispose()
+    {
+        Texture.Dispose();
+        _surface.Dispose();
+        _frame.Dispose();
     }
 }
 #pragma warning restore CA1416

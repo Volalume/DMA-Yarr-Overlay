@@ -31,7 +31,7 @@ DXGI Desktop Duplication resource
 
 Capture, drawing, and Present run serially on one dedicated MTA capture thread. The UI thread is not in this path. The source copy remains because a Desktop Duplication resource is not guaranteed to have the shader-resource bind flags needed to create an SRV; there is no second output texture. The GPU Native context does not even allocate legacy output/staging resources.
 
-The composition swap chain is `B8G8R8A8_UNORM`, two-buffer, `FLIP_SEQUENTIAL`, stretch-scaled, and premultiplied-alpha. The shader multiplies RGB by its final alpha. The DirectComposition visual is attached to the existing topmost, no-activate, transparent/tool-window HWND, preserving click-through behavior.
+The composition swap chain is `B8G8R8A8_UNORM`, two-buffer, `FLIP_SEQUENTIAL`, stretch-scaled, and premultiplied-alpha. The shader's alpha comes only from the brightness key (the desktop image's own alpha is undefined), and RGB is multiplied by it. The DirectComposition visual is attached to the existing topmost, no-activate, transparent/tool-window HWND, preserving click-through behavior.
 
 `Present(0, DO_NOT_WAIT)` returns `DXGI_ERROR_WAS_STILL_DRAWING` instead of blocking. Such a frame is counted as dropped; no Present backlog or software queue is allowed. Device maximum frame latency defaults to one. A frame-latency waitable handle is not used because the capture-driven path must not wait for a queued frame; the user may select device maximum latency 1-3 for comparison.
 
@@ -41,7 +41,7 @@ The explicit fallback retains the staging/Map/Bitmap/UpdateLayeredWindow path on
 
 ## 3. Scheduling and submission policy
 
-- `AcquireNextFrame(0)` remains non-blocking. A `SpinWait` progressively mixes spinning and yielding; there is no unconditional `Sleep(1)`.
+- The capture thread blocks on the kernel frame signal (`AcquireNextFrame` with a 100 ms timeout, or the WGC `FrameArrived` event) instead of polling. A polling loop would fall back to `Sleep(1)`, which waits up to 15.6 ms at the default timer resolution and caps delivery near 64 FPS. WGC drains its pool and keeps only the newest frame, stamped with its `SystemRelativeTime`.
 - Pointer-only updates (`LastPresentTime == 0`) are not rendered again.
 - Only the latest frame is useful. GPU Native has no CPU frame queue; Legacy has one replaceable slot.
 - Threshold and sharpness use volatile reads/writes. The constant buffer is updated only when its value changes.
@@ -66,7 +66,7 @@ Every accepted frame has a monotonically increasing `FrameId` and QPC/`Stopwatch
 
 ## 5. Aggregation and overhead control
 
-Recent 1-second and 10-second samples live in a fixed 65,536-entry ring. Whole-session percentiles use fixed 0.05 ms histograms instead of an unbounded list. Current, average, minimum, maximum, P50, P95, and P99 are generated on the 4 Hz UI snapshot path; no per-frame LINQ or sort exists. `Current` is the newest sample, not the maximum.
+Recent 1-second and 10-second samples live in a fixed 65,536-entry ring. A snapshot copies only the samples inside the 10-second window, and whole-session percentiles come from fixed 0.05 ms histograms read in a single pass, so the lock shared with the capture thread is held briefly. Current, average, minimum, maximum, P50, P95, and P99 are generated on the 4 Hz UI snapshot path; no per-frame LINQ or sort exists. `Current` is the newest sample, not the maximum.
 
 Counters include captured/submitted/replaced/dropped frames, acquire timeouts, DXGI errors, `AccumulatedFrames` sum/max, and queue current/max. The settings status also shows duplication recreations, last DXGI error, last-good-frame age, capture/render thread IDs, adapters/same-adapter, CSV loss, recovery duration, GC counts, allocation total, and working set.
 
