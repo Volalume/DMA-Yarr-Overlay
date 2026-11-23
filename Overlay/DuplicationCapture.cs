@@ -48,7 +48,6 @@ internal sealed class DuplicationCapture : IDisposable
         // active so the protected WGC path still reports an ms value even if the
         // user selected Metrics: Off. Detailed GPU timing remains opt-in.
         var collectMetrics = _options.MetricsMode != MetricsMode.Off || _options.GpuProtection == GpuProtectionMode.HardwareRequired;
-        var spin = new SpinWait();
         try
         {
         while (!token.IsCancellationRequested)
@@ -82,8 +81,10 @@ internal sealed class DuplicationCapture : IDisposable
                 {
                     pipelineStage = "ValidateProtection";
                     gpu?.ValidateProtectionIfDue();
+                    PublishDiagnosticsIfDue(ref frames, fpsClock, dropped, failures, lastFrame, recreateCount, pipelineName, csv?.LostRows ?? 0, lastError, lastRecoveryMs, totalRecoveryMs);
                     IDXGIResource? resource = null;
                     ID3D11Texture2D? sourceTexture = null;
+                    GraphicsCaptureFrame? wgcFrame = null;
                     try
                     {
                         var timing = new FrameTiming { AcquireCallStart = FrameTiming.Now };
@@ -94,27 +95,24 @@ internal sealed class DuplicationCapture : IDisposable
                         bool pointerVisible = false, protectedMaskedOut = false;
                         if (context.Wgc is not null)
                         {
+                            pipelineStage = "WgcWaitForFrame";
+                            if (!context.Wgc.WaitForFrame(AcquireTimeoutMs)) { if(collectMetrics)_metrics.RecordTimeout(); continue; }
                             pipelineStage = "WgcTryGetNextFrame";
-                            sourceTexture = context.Wgc.TryGetNextTexture();
+                            wgcFrame = context.Wgc.TryGetLatestFrame();
                             timing.AcquireReturned = FrameTiming.Now;
-                            if (sourceTexture is null)
-                            {
-                                if(collectMetrics)_metrics.RecordTimeout();
-                                spin.SpinOnce();
-                                continue;
-                            }
-                            desktopPresentTime = timing.AcquireReturned;
+                            if (wgcFrame is null) continue;
+                            sourceTexture = wgcFrame.Texture; desktopPresentTime = wgcFrame.PresentQpc;
                             timing.DesktopPresentTime = desktopPresentTime;
                         }
                         else
                         {
                             pipelineStage = "AcquireNextFrame";
-                            var result = context.Duplication!.AcquireNextFrame(0, out var frameInfo, out resource);
+                            var result = context.Duplication!.AcquireNextFrame(AcquireTimeoutMs, out var frameInfo, out resource);
                             timing.AcquireReturned = FrameTiming.Now; timing.DesktopPresentTime = frameInfo.LastPresentTime; timing.DesktopMouseUpdateTime = frameInfo.LastMouseUpdateTime; timing.AccumulatedFrames = (int)frameInfo.AccumulatedFrames; timing.TotalMetadataBufferSize = frameInfo.TotalMetadataBufferSize; timing.PointerVisible = frameInfo.PointerPosition.Visible; timing.ProtectedContentMaskedOut = frameInfo.ProtectedContentMaskedOut;
                             accumulatedFrames = (int)frameInfo.AccumulatedFrames; desktopPresentTime = frameInfo.LastPresentTime; desktopMouseUpdateTime = frameInfo.LastMouseUpdateTime; metadataSize = frameInfo.TotalMetadataBufferSize; pointerVisible = frameInfo.PointerPosition.Visible; protectedMaskedOut = frameInfo.ProtectedContentMaskedOut;
                             if (result.Failure)
                             {
-                                if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { if(collectMetrics)_metrics.RecordTimeout(); spin.SpinOnce(sleep1Threshold: -1); continue; }
+                                if (result.Code == Vortice.DXGI.ResultCode.WaitTimeout.Code) { if(collectMetrics)_metrics.RecordTimeout(); continue; }
                                 if(collectMetrics)_metrics.RecordDxgiError();
                                 failures++; var error = $"AcquireNextFrame failed: 0x{result.Code:X8}"; lastError = error;
                                 var sinceLoss = lastLossTick == 0 ? -1 : FrameTiming.Ms(lastLossTick, FrameTiming.Now);
@@ -147,7 +145,7 @@ internal sealed class DuplicationCapture : IDisposable
                             sourceTexture = resource!.QueryInterface<ID3D11Texture2D>();
                         }
                         timing.DesktopMouseUpdateTime = desktopMouseUpdateTime; timing.AccumulatedFrames = accumulatedFrames; timing.TotalMetadataBufferSize = metadataSize; timing.PointerVisible = pointerVisible; timing.ProtectedContentMaskedOut = protectedMaskedOut;
-                        spin.Reset(); if(collectMetrics)_metrics.RecordCaptured(accumulatedFrames);
+                        if(collectMetrics)_metrics.RecordCaptured(accumulatedFrames);
                         frameSequence++;
                         pipelineStage = "CopyResource";
                         if (gpuTimestamps is not null)
@@ -201,7 +199,6 @@ internal sealed class DuplicationCapture : IDisposable
                             if(collectMetrics) LatencyMetrics.Global.RecordSubmitted(timing); lastFrame = DateTimeOffset.Now; frames++;
                             if (csv is not null && timing.FrameId % _options.CsvIntervalFrames == 0) csv.TryWrite(timing, pipelineName, _input.AdapterName, _output.AdapterName, 0, present.ResultCode);
                             _metrics.RenderThreadId = Environment.CurrentManagedThreadId;
-                            PublishDiagnosticsIfDue(ref frames, fpsClock, dropped, failures, lastFrame, recreateCount, pipelineName, csv?.LostRows ?? 0, lastError, lastRecoveryMs, totalRecoveryMs);
                             continue;
                         }
 
@@ -212,9 +209,8 @@ internal sealed class DuplicationCapture : IDisposable
                         try { var frame = new Bitmap(context.OutputWidth, context.OutputHeight, PixelFormat.Format32bppArgb); timing.CpuCopyStarted = FrameTiming.Now; CopyToBitmap(frame, mapped.DataPointer, (int)mapped.RowPitch); timing.CpuCopyFinished = FrameTiming.Now; timing.FrameEventRaised = FrameTiming.Now; FrameReady?.Invoke(new FrameEnvelope(frame, timing, csv, pipelineName, _input.AdapterName, _output.AdapterName, _options.CsvIntervalFrames, collectMetrics)); }
                         finally { context.DeviceContext.Unmap(context.LegacyStaging!, 0); }
                         lastFrame = DateTimeOffset.Now; frames++;
-                        PublishDiagnosticsIfDue(ref frames, fpsClock, dropped, failures, lastFrame, recreateCount, pipelineName, csv?.LostRows ?? 0, lastError, lastRecoveryMs, totalRecoveryMs);
                     }
-                    finally { sourceTexture?.Dispose(); if (resource is not null) { context.Duplication!.ReleaseFrame(); resource.Dispose(); } }
+                    finally { if (wgcFrame is not null) wgcFrame.Dispose(); else sourceTexture?.Dispose(); if (resource is not null) { context.Duplication!.ReleaseFrame(); resource.Dispose(); } }
                 }
                 }
             }
@@ -247,11 +243,15 @@ internal sealed class DuplicationCapture : IDisposable
         finally { if (mmcss != IntPtr.Zero) NativeMethods.AvRevertMmThreadCharacteristics(mmcss); }
     }
 
+    // Both capture backends signal new frames from the kernel, so the loop blocks
+    // instead of polling. The timeout only bounds cancellation and the periodic
+    // protection check; a frame wakes the thread immediately.
+    private const uint AcquireTimeoutMs = 100;
+
     private void PublishDiagnosticsIfDue(ref int frames, Stopwatch clock, long dropped, int failures, DateTimeOffset? lastFrame, int recreates, string pipeline, long csvLost, string lastError, double lastRecoveryMs, double totalRecoveryMs)
     {
         if (clock.ElapsedMilliseconds < 1000) return;
-        using var process=Process.GetCurrentProcess();
-        DiagnosticsChanged?.Invoke(new CaptureDiagnostics(frames, dropped, failures, lastFrame, lastFrame is null || DateTimeOffset.Now - lastFrame > TimeSpan.FromSeconds(2), recreates, lastError, _metrics.Snapshot(), pipeline, Environment.CurrentManagedThreadId, _metrics.RenderThreadId, _input?.AdapterName ?? "", _output?.AdapterName ?? "", _input?.AdapterLuid == _output?.AdapterLuid, csvLost, GC.CollectionCount(0),GC.CollectionCount(1),GC.CollectionCount(2),GC.GetTotalAllocatedBytes(false),process.WorkingSet64, lastRecoveryMs, totalRecoveryMs));
+        DiagnosticsChanged?.Invoke(new CaptureDiagnostics(frames, dropped, failures, lastFrame, lastFrame is null || DateTimeOffset.Now - lastFrame > TimeSpan.FromSeconds(2), recreates, lastError, _metrics.Snapshot(), pipeline, Environment.CurrentManagedThreadId, _metrics.RenderThreadId, _input?.AdapterName ?? "", _output?.AdapterName ?? "", _input?.AdapterLuid == _output?.AdapterLuid, csvLost, GC.CollectionCount(0),GC.CollectionCount(1),GC.CollectionCount(2),GC.GetTotalAllocatedBytes(false),Environment.WorkingSet, lastRecoveryMs, totalRecoveryMs));
         frames = 0; clock.Restart();
     }
     private static bool IsRecoverable(int code) => code == Vortice.DXGI.ResultCode.AccessLost.Code || code == Vortice.DXGI.ResultCode.InvalidCall.Code || code == Vortice.DXGI.ResultCode.DeviceRemoved.Code || code == Vortice.DXGI.ResultCode.DeviceReset.Code;
@@ -345,7 +345,7 @@ internal sealed class DuplicationCapture : IDisposable
 cbuffer P : register(b0) { float threshold, feather, invW, invH, sharpness, scaleX, scaleY, rotation; }; Texture2D t : register(t0); SamplerState s : register(s0);
 struct O { float4 p:SV_POSITION; float2 uv:TEXCOORD0; }; O VSMain(uint id:SV_VertexID) { float2 ps[3]={float2(-1,-1),float2(-1,3),float2(3,-1)}; float2 u[3]={float2(0,1),float2(0,-1),float2(2,1)}; O o; o.p=float4(ps[id],0,1); o.uv=u[id]; return o; }
 float2 RotateUv(float2 u) { if(rotation==1) return float2(1-u.y,u.x); if(rotation==2) return 1-u; if(rotation==3) return float2(u.y,1-u.x); return u; }
-float4 PSMain(O i):SV_TARGET { float2 uv=(i.uv-float2(.5,.5))/float2(scaleX,scaleY)+float2(.5,.5); if(any(uv<0)||any(uv>1)) return 0; uv=RotateUv(uv); float2 q=float2(invW,invH); float4 c=t.Sample(s,uv); float3 a=(t.Sample(s,uv+float2(q.x,0)).rgb+t.Sample(s,uv-float2(q.x,0)).rgb+t.Sample(s,uv+float2(0,q.y)).rgb+t.Sample(s,uv-float2(0,q.y)).rgb)*.25; c.rgb=saturate(c.rgb+(c.rgb-a)*sharpness); c.a*=saturate((max(c.r,max(c.g,c.b))-threshold)/max(feather,.00001)); c.rgb*=c.a; return c; }
+float4 PSMain(O i):SV_TARGET { float2 uv=(i.uv-float2(.5,.5))/float2(scaleX,scaleY)+float2(.5,.5); if(any(uv<0)||any(uv>1)) return 0; uv=RotateUv(uv); float2 q=float2(invW,invH); float4 c=t.Sample(s,uv); float3 a=(t.Sample(s,uv+float2(q.x,0)).rgb+t.Sample(s,uv-float2(q.x,0)).rgb+t.Sample(s,uv+float2(0,q.y)).rgb+t.Sample(s,uv-float2(0,q.y)).rgb)*.25; c.rgb=saturate(c.rgb+(c.rgb-a)*sharpness); c.a=saturate((max(c.r,max(c.g,c.b))-threshold)/max(feather,.00001)); c.rgb*=c.a; return c; }
 """;
     private sealed class CaptureContext : IDisposable
     {
